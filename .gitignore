@@ -1,0 +1,26 @@
+# 로컬 데이터
+todos.json
+
+# Python 가상환경
+.venv/
+venv/
+env/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Streamlit 시크릿 (예시 파일은 제외)
+.streamlit/secrets.toml
+
+# 환경 변수
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
