@@ -228,12 +228,14 @@ def load_todos() -> list[dict]:
 def enrich_todos_with_roles(todos: list[dict], roles: list[dict]) -> list[dict]:
     """할 일 목록에 role_tag/role_name을 roles.json 기준으로 최신화합니다.
     등록된 @태그만 역할로 인정하며, 미등록 @태그만 있는 todo는 "미분류"가 됩니다.
+    기존 todo에 memo 필드가 없으면 빈 문자열로 보정합니다.
     메모리만 변경하므로 todos.json은 자동 덮어쓰지 않습니다.
     """
     for item in todos:
         tag, name = extract_role_from_title(item.get("title", ""), roles)
         item["role_tag"] = tag
         item["role_name"] = name
+        item.setdefault("memo", "")
     return todos
 
 
@@ -270,6 +272,7 @@ def add_todo(
         "priority": priority,
         "role_tag": role_tag,
         "role_name": role_name,
+        "memo": "",
         "done": False,
         "created_at": now,
         "updated_at": now,
@@ -312,6 +315,7 @@ def update_todo(
     start_date: str,
     due_date: str,
     priority: str,
+    memo: str,
     roles: list[dict],
 ) -> tuple[bool, str]:
     """특정 할 일의 기본 필드를 수정하고 저장합니다.
@@ -333,6 +337,7 @@ def update_todo(
             todo["start_date"] = start_date
             todo["due_date"] = due_date
             todo["priority"] = priority
+            todo["memo"] = memo if memo is not None else ""
             role_tag, role_name = extract_role_from_title(title, roles)
             todo["role_tag"] = role_tag
             todo["role_name"] = role_name
@@ -422,6 +427,14 @@ STATUS_COLOR = {
     "날짜 오류": "⚠️",
 }
 STATUS_ORDER = {"지연": 0, "오늘 마감": 1, "진행 중": 2, "예정": 3, "완료": 4, "날짜 오류": 5}
+
+
+def summarize_memo(memo: str, max_len: int = 80) -> str:
+    """메모를 한 줄 요약 문자열로 반환합니다. 줄바꿈은 공백으로 치환하며 max_len 초과 시 '...'을 붙입니다."""
+    text = " ".join(str(memo or "").split())
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
 
 
 def sort_todos_for_today(
@@ -624,13 +637,21 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         st.info("오늘 할 일이 없습니다.")
         return
 
-    sort_mode = st.radio(
-        "정렬 기준",
-        ["분류", "상태", "우선순위"],
-        horizontal=True,
-        key="today_sort_mode",
-        label_visibility="collapsed",
-    )
+    sort_col, memo_col = st.columns([3, 1])
+    with sort_col:
+        sort_mode = st.radio(
+            "정렬 기준",
+            ["분류", "상태", "우선순위"],
+            horizontal=True,
+            key="today_sort_mode",
+            label_visibility="collapsed",
+        )
+    with memo_col:
+        show_today_memo = st.checkbox(
+            "메모 표시",
+            value=False,
+            key="today_show_memo",
+        )
 
     today_todos_sorted = sort_todos_for_today(today_todos, selected_date, sort_mode)
 
@@ -650,9 +671,13 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
             )
         with col2:
             role_label = todo.get("role_name", "미분류")
+            _today_memo = str(todo.get("memo", "") or "")
+            memo_flag = " 📝" if _today_memo.strip() and not show_today_memo else ""
+            memo_line = f"  \n📝 {summarize_memo(_today_memo)}" if show_today_memo and _today_memo.strip() else ""
             st.markdown(
-                f"{icon} **{todo['title']}**  \n"
+                f"{icon}{memo_flag} **{todo['title']}**  \n"
                 f"[{role_label}] 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')}"
+                f"{memo_line}"
             )
         if new_done != current_done:
             update_todo_done(todo_id, new_done)
@@ -799,9 +824,12 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                     )
                 with c2:
                     role_label = todo.get("role_name", "미분류")
+                    _memo = str(todo.get("memo", "") or "")
+                    _memo_line = f"  \n📝 {summarize_memo(_memo)}" if _memo.strip() else ""
                     st.markdown(
                         f"{icon} **{todo['title']}**  \n"
                         f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')} | 상태: {status}"
+                        f"{_memo_line}"
                     )
                 with action_col:
                     edit_col, del_col = st.columns(2)
@@ -850,6 +878,12 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                                 index=_pri_idx,
                                 key=f"edit_priority_{todo_id}",
                             )
+                        new_memo = st.text_area(
+                            "메모",
+                            value=todo.get("memo", ""),
+                            key=f"edit_memo_{todo_id}",
+                            height=100,
+                        )
                         btn_col1, btn_col2, btn_spacer = st.columns([1, 1, 5])
                         with btn_col1:
                             save_clicked = st.form_submit_button("저장")
@@ -866,6 +900,7 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                             start_date=new_start.isoformat(),
                             due_date=new_due.isoformat(),
                             priority=new_priority,
+                            memo=new_memo,
                             roles=roles,
                         )
                         if ok:
