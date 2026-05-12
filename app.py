@@ -306,6 +306,21 @@ def find_todo(todos: list[dict], todo_id: str) -> dict | None:
     return None
 
 
+def count_completed_todos(todos: list[dict]) -> int:
+    """done == True인 항목 수를 반환합니다."""
+    return sum(1 for t in todos if bool(t.get("done", False)))
+
+
+def delete_completed_todos() -> int:
+    """todos.json에서 done == True인 항목을 모두 삭제하고 삭제 개수를 반환합니다."""
+    todos = load_todos()
+    remaining = [t for t in todos if not bool(t.get("done", False))]
+    deleted_count = len(todos) - len(remaining)
+    if deleted_count > 0:
+        save_todos(remaining)
+    return deleted_count
+
+
 # ---------------------------------------------------------------------------
 # 상태 계산 함수
 # ---------------------------------------------------------------------------
@@ -370,6 +385,28 @@ STATUS_COLOR = {
     "지연": "🔴",
     "날짜 오류": "⚠️",
 }
+STATUS_ORDER = {"지연": 0, "오늘 마감": 1, "진행 중": 2, "예정": 3, "완료": 4, "날짜 오류": 5}
+
+
+def sort_todos_for_today(
+    todos: list[dict], selected_date: date, sort_mode: str
+) -> list[dict]:
+    """오늘 할 일 목록을 sort_mode에 따라 정렬합니다."""
+    def _key(t: dict):
+        status = compute_status(t, selected_date)
+        s_ord = STATUS_ORDER.get(status, 9)
+        p_ord = PRIORITY_ORDER.get(t.get("priority", "하"), 2)
+        due = t.get("due_date", "")
+        role = t.get("role_name") or "\uffff"  # 미분류를 마지막으로
+        if sort_mode == "분류":
+            # 미분류(role_tag=='')는 맨 뒤
+            is_unclassified = 0 if t.get("role_tag") else 1
+            return (is_unclassified, role, s_ord, p_ord, due)
+        elif sort_mode == "상태":
+            return (s_ord, p_ord, due, role)
+        else:  # 우선순위
+            return (p_ord, s_ord, due, role)
+    return sorted(todos, key=_key)
 
 
 def build_display_df(todos: list[dict], selected_date: date) -> pd.DataFrame:
@@ -535,6 +572,13 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
     """오늘 할 일 보기 섹션을 렌더링합니다."""
     st.subheader("📋 오늘 할 일")
 
+    sort_mode = st.radio(
+        "정렬 기준",
+        ["분류", "상태", "우선순위"],
+        horizontal=True,
+        key="today_sort_mode",
+    )
+
     today_todos = []
     for todo in todos:
         if todo.get("done"):
@@ -551,13 +595,7 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         st.info("오늘 할 일이 없습니다.")
         return
 
-    today_todos_sorted = sorted(
-        today_todos,
-        key=lambda t: (
-            PRIORITY_ORDER.get(t.get("priority", "하"), 2),
-            t.get("due_date", ""),
-        ),
-    )
+    today_todos_sorted = sort_todos_for_today(today_todos, selected_date, sort_mode)
 
     for todo in today_todos_sorted:
         status = compute_status(todo, selected_date)
@@ -565,7 +603,7 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         todo_id = todo["id"]
         current_done = bool(todo.get("done", False))
         checkbox_key = get_done_checkbox_key("today", todo)
-        col1, col2 = st.columns([0.08, 0.92])
+        col1, col2, col3 = st.columns([0.06, 0.86, 0.08])
         with col1:
             new_done = st.checkbox(
                 label="완료",
@@ -579,6 +617,10 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
                 f"{icon} **{todo['title']}**  \n"
                 f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')}"
             )
+        with col3:
+            if st.button("🗑", key=f"today_del_{todo_id}", help="삭제"):
+                delete_todo(todo_id)
+                st.rerun()
         if new_done != current_done:
             update_todo_done(todo_id, new_done)
             st.rerun()
@@ -587,102 +629,154 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
 def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -> None:
     """전체 보기 섹션을 렌더링합니다.
     main()에서 enrich된 todos를 받아 필터링에 반영합니다.
+    좌측: todo 목록 / 우측: 보기 설정 + 분류 체크박스 + 완료 항목 일괄 삭제
     """
     st.subheader("📂 전체 보기")
 
-    role_filter_options = build_role_filter_options(roles)
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        show_done = st.checkbox("완료 항목 포함", value=True)
-    with col2:
-        priority_filter = st.selectbox(
-            "우선순위 필터",
-            ["전체", "상", "중", "하"],
-            key="priority_filter",
-        )
-    with col3:
-        status_filter = st.selectbox(
-            "상태 필터",
-            ["전체", "예정", "진행 중", "오늘 마감", "지연", "완료"],
-            key="status_filter",
-        )
-    with col4:
-        role_filter = st.selectbox(
-            "역할 필터",
-            role_filter_options,
-            key="role_filter",
-        )
-
+    active_roles = [r for r in roles if r.get("active") and r.get("name")]
     inactive_role_names = {
         r["name"] for r in roles if not r.get("active") and r.get("name")
     }
 
-    filtered = []
-    for todo in todos:
-        status = compute_status(todo, selected_date)
-        todo_role_name = todo.get("role_name", "미분류")
-        todo_role_tag = todo.get("role_tag", "")
+    left_col, right_col = st.columns([4, 1])
 
-        if not show_done and todo.get("done"):
-            continue
-        if priority_filter != "전체" and todo.get("priority") != priority_filter:
-            continue
-        if status_filter != "전체" and status != status_filter:
-            continue
-        if role_filter != "전체":
-            if role_filter == "미분류":
-                if todo_role_tag != "":
-                    continue
-            elif role_filter == "비활성 역할":
-                if todo_role_name not in inactive_role_names:
-                    continue
-            else:
-                if todo_role_name != role_filter:
-                    continue
-        filtered.append(todo)
+    # ── 우측 패널: 보기 설정 ───────────────────────────────────────────
+    with right_col:
+        st.markdown("**보기 설정**")
 
-    if not filtered:
-        st.info("표시할 항목이 없습니다.")
-        return
+        show_done = st.checkbox("완료 항목 포함", value=True, key="all_show_done")
+        priority_filter = st.selectbox(
+            "우선순위",
+            ["전체", "상", "중", "하"],
+            key="priority_filter",
+        )
+        status_filter = st.selectbox(
+            "상태",
+            ["전체", "예정", "진행 중", "오늘 마감", "지연", "완료"],
+            key="status_filter",
+        )
 
-    filtered_sorted = sorted(
-        filtered,
-        key=lambda t: (
-            PRIORITY_ORDER.get(t.get("priority", "하"), 2),
-            t.get("due_date", ""),
-        ),
-    )
+        st.markdown("**분류 표시**")
 
-    for todo in filtered_sorted:
-        status = compute_status(todo, selected_date)
-        icon = STATUS_COLOR.get(status, "")
-        todo_id = todo["id"]
-        current_done = bool(todo.get("done", False))
-        checkbox_key = get_done_checkbox_key("all", todo)
-        c1, c2, c3 = st.columns([0.05, 0.85, 0.10])
-        with c1:
-            new_done = st.checkbox(
-                label="완료",
-                value=current_done,
-                key=checkbox_key,
-                label_visibility="collapsed",
-            )
-        with c2:
-            role_label = todo.get("role_name", "미분류")
-            st.markdown(
-                f"{icon} **{todo['title']}**  \n"
-                f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')} | 상태: {status}"
-            )
-        with c3:
-            if st.button("🗑️ 삭제", key=f"del_{todo_id}"):
-                delete_todo(todo_id)
-                st.rerun()
-        if new_done != current_done:
-            update_todo_done(todo_id, new_done)
+        # 전체 체크 / 전체 해제 버튼 (checkbox 렌더링 전에 배치)
+        _vis_keys = (
+            [f"vis_role_{r['tag']}" for r in active_roles]
+            + (["vis_inactive"] if inactive_role_names else [])
+            + ["vis_unclassified"]
+        )
+        _sel_col, _clr_col = st.columns(2)
+        if _sel_col.button("전체 체크", key="role_vis_select_all"):
+            for _k in _vis_keys:
+                st.session_state[_k] = True
+            st.rerun()
+        if _clr_col.button("전체 해제", key="role_vis_clear_all"):
+            for _k in _vis_keys:
+                st.session_state[_k] = False
             st.rerun()
 
-    st.caption(f"총 {len(filtered_sorted)}개 항목")
+        # 분류별 체크박스: active 역할 → 비활성 역할 → 미분류 순
+        # (view filter — roles.json active 변경 없음)
+        role_vis: dict[str, bool] = {}
+        for role in active_roles:
+            rname = role["name"]
+            safe_key = f"vis_role_{role['tag']}"
+            role_vis[rname] = st.checkbox(rname, value=True, key=safe_key)
+        if inactive_role_names:
+            role_vis["__inactive__"] = st.checkbox(
+                "비활성 역할", value=True, key="vis_inactive"
+            )
+        role_vis["미분류"] = st.checkbox("미분류", value=True, key="vis_unclassified")
+
+        st.divider()
+
+        # ── 완료 항목 일괄 삭제 ────────────────────────────────────────
+        st.markdown("**완료 항목 정리**")
+        completed_count = count_completed_todos(todos)
+        if completed_count == 0:
+            st.caption("완료 항목이 없습니다.")
+        else:
+            st.caption(f"완료 항목: {completed_count}개")
+            confirm_delete = st.checkbox(
+                f"완료 항목 {completed_count}개 삭제를 확인합니다.",
+                value=False,
+                key="confirm_bulk_delete",
+            )
+            if st.button("완료 항목 일괄 삭제", key="bulk_delete_btn"):
+                if not confirm_delete:
+                    st.warning("삭제를 확인하려면 위 체크박스를 선택해 주세요.")
+                else:
+                    deleted = delete_completed_todos()
+                    st.success(f"완료 항목 {deleted}개를 삭제했습니다.")
+                    st.rerun()
+
+    # ── 좌측 패널: todo 목록 ──────────────────────────────────────────
+    with left_col:
+        # 1) 완료 포함 여부
+        filtered = [t for t in todos if show_done or not t.get("done")]
+
+        # 2) 우선순위 필터
+        if priority_filter != "전체":
+            filtered = [t for t in filtered if t.get("priority") == priority_filter]
+
+        # 3) 상태 필터
+        if status_filter != "전체":
+            filtered = [
+                t for t in filtered
+                if compute_status(t, selected_date) == status_filter
+            ]
+
+        # 4) 분류 체크박스 필터
+        def _role_visible(todo: dict) -> bool:
+            todo_role_tag = todo.get("role_tag", "")
+            todo_role_name = todo.get("role_name", "미분류")
+            if not todo_role_tag:
+                return role_vis.get("미분류", True)
+            if todo_role_name in inactive_role_names:
+                return role_vis.get("__inactive__", True)
+            return role_vis.get(todo_role_name, True)
+
+        filtered = [t for t in filtered if _role_visible(t)]
+
+        if not filtered:
+            st.info("표시할 항목이 없습니다.")
+        else:
+            filtered_sorted = sorted(
+                filtered,
+                key=lambda t: (
+                    PRIORITY_ORDER.get(t.get("priority", "하"), 2),
+                    t.get("due_date", ""),
+                ),
+            )
+
+            for todo in filtered_sorted:
+                status = compute_status(todo, selected_date)
+                icon = STATUS_COLOR.get(status, "")
+                todo_id = todo["id"]
+                current_done = bool(todo.get("done", False))
+                checkbox_key = get_done_checkbox_key("all", todo)
+                c1, c2, c3 = st.columns([0.05, 0.85, 0.10])
+                with c1:
+                    new_done = st.checkbox(
+                        label="완료",
+                        value=current_done,
+                        key=checkbox_key,
+                        label_visibility="collapsed",
+                    )
+                with c2:
+                    role_label = todo.get("role_name", "미분류")
+                    st.markdown(
+                        f"{icon} **{todo['title']}**  \n"
+                        f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')} | 상태: {status}"
+                    )
+                with c3:
+                    if st.button("🗑", key=f"del_{todo_id}", help="삭제"):
+                        delete_todo(todo_id)
+                        st.rerun()
+                if new_done != current_done:
+                    update_todo_done(todo_id, new_done)
+                    st.rerun()
+
+            st.caption(f"총 {len(filtered_sorted)}개 항목")
 
 
 def _render_role_rows(role_list: list[dict]) -> None:
