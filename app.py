@@ -306,6 +306,42 @@ def find_todo(todos: list[dict], todo_id: str) -> dict | None:
     return None
 
 
+def update_todo(
+    todo_id: str,
+    title: str,
+    start_date: str,
+    due_date: str,
+    priority: str,
+    roles: list[dict],
+) -> tuple[bool, str]:
+    """특정 할 일의 기본 필드를 수정하고 저장합니다.
+    성공 시 (True, 메시지), 실패 시 (False, 오류 메시지)를 반환합니다.
+    """
+    title = title.strip()
+    if not title:
+        return False, "할 일 제목을 입력해 주세요."
+    start = _parse_date(start_date)
+    due = _parse_date(due_date)
+    if start is None or due is None:
+        return False, "날짜 형식이 올바르지 않습니다."
+    if due < start:
+        return False, "마감일은 시작일보다 이전일 수 없습니다."
+    todos = load_todos()
+    for todo in todos:
+        if todo["id"] == todo_id:
+            todo["title"] = title
+            todo["start_date"] = start_date
+            todo["due_date"] = due_date
+            todo["priority"] = priority
+            role_tag, role_name = extract_role_from_title(title, roles)
+            todo["role_tag"] = role_tag
+            todo["role_name"] = role_name
+            todo["updated_at"] = datetime.now().isoformat()
+            save_todos(todos)
+            return True, "수정했습니다."
+    return False, "해당 할 일을 찾을 수 없습니다."
+
+
 def count_completed_todos(todos: list[dict]) -> int:
     """done == True인 항목 수를 반환합니다."""
     return sum(1 for t in todos if bool(t.get("done", False)))
@@ -572,13 +608,6 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
     """오늘 할 일 보기 섹션을 렌더링합니다."""
     st.subheader("📋 오늘 할 일")
 
-    sort_mode = st.radio(
-        "정렬 기준",
-        ["분류", "상태", "우선순위"],
-        horizontal=True,
-        key="today_sort_mode",
-    )
-
     today_todos = []
     for todo in todos:
         if todo.get("done"):
@@ -595,6 +624,14 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         st.info("오늘 할 일이 없습니다.")
         return
 
+    sort_mode = st.radio(
+        "정렬 기준",
+        ["분류", "상태", "우선순위"],
+        horizontal=True,
+        key="today_sort_mode",
+        label_visibility="collapsed",
+    )
+
     today_todos_sorted = sort_todos_for_today(today_todos, selected_date, sort_mode)
 
     for todo in today_todos_sorted:
@@ -603,7 +640,7 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         todo_id = todo["id"]
         current_done = bool(todo.get("done", False))
         checkbox_key = get_done_checkbox_key("today", todo)
-        col1, col2, col3 = st.columns([0.06, 0.86, 0.08])
+        col1, col2 = st.columns([0.06, 0.94])
         with col1:
             new_done = st.checkbox(
                 label="완료",
@@ -615,12 +652,8 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
             role_label = todo.get("role_name", "미분류")
             st.markdown(
                 f"{icon} **{todo['title']}**  \n"
-                f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')}"
+                f"[{role_label}] 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')}"
             )
-        with col3:
-            if st.button("🗑", key=f"today_del_{todo_id}", help="삭제"):
-                delete_todo(todo_id)
-                st.rerun()
         if new_done != current_done:
             update_todo_done(todo_id, new_done)
             st.rerun()
@@ -754,7 +787,9 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                 todo_id = todo["id"]
                 current_done = bool(todo.get("done", False))
                 checkbox_key = get_done_checkbox_key("all", todo)
-                c1, c2, c3 = st.columns([0.05, 0.85, 0.10])
+                is_editing = st.session_state.get("editing_todo_id") == todo_id
+
+                c1, c2, action_col = st.columns([0.05, 0.84, 0.11])
                 with c1:
                     new_done = st.checkbox(
                         label="완료",
@@ -768,13 +803,77 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                         f"{icon} **{todo['title']}**  \n"
                         f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')} | 상태: {status}"
                     )
-                with c3:
-                    if st.button("🗑", key=f"del_{todo_id}", help="삭제"):
-                        delete_todo(todo_id)
-                        st.rerun()
+                with action_col:
+                    edit_col, del_col = st.columns(2)
+                    with edit_col:
+                        if st.button("✏️", key=f"edit_btn_{todo_id}", help="수정"):
+                            st.session_state["editing_todo_id"] = todo_id
+                            st.rerun()
+                    with del_col:
+                        if st.button("🗑", key=f"del_{todo_id}", help="삭제"):
+                            if st.session_state.get("editing_todo_id") == todo_id:
+                                st.session_state.pop("editing_todo_id", None)
+                            delete_todo(todo_id)
+                            st.rerun()
                 if new_done != current_done:
                     update_todo_done(todo_id, new_done)
                     st.rerun()
+
+                if is_editing:
+                    _start_default = _parse_date(todo.get("start_date", "")) or date.today()
+                    _due_default = _parse_date(todo.get("due_date", "")) or date.today()
+                    with st.form(key=f"edit_form_{todo_id}"):
+                        new_title = st.text_input(
+                            "할 일 제목",
+                            value=todo.get("title", ""),
+                            key=f"edit_title_{todo_id}",
+                        )
+                        col_s, col_d, col_p = st.columns(3)
+                        with col_s:
+                            new_start = st.date_input(
+                                "시작일",
+                                value=_start_default,
+                                key=f"edit_start_{todo_id}",
+                            )
+                        with col_d:
+                            new_due = st.date_input(
+                                "마감일",
+                                value=_due_default,
+                                key=f"edit_due_{todo_id}",
+                            )
+                        with col_p:
+                            _pri_options = ["상", "중", "하"]
+                            _pri_idx = _pri_options.index(todo.get("priority", "중")) if todo.get("priority", "중") in _pri_options else 1
+                            new_priority = st.selectbox(
+                                "우선순위",
+                                _pri_options,
+                                index=_pri_idx,
+                                key=f"edit_priority_{todo_id}",
+                            )
+                        btn_col1, btn_col2, btn_spacer = st.columns([1, 1, 5])
+                        with btn_col1:
+                            save_clicked = st.form_submit_button("저장")
+                        with btn_col2:
+                            cancel_clicked = st.form_submit_button("취소")
+
+                    if cancel_clicked:
+                        st.session_state.pop("editing_todo_id", None)
+                        st.rerun()
+                    if save_clicked:
+                        ok, msg = update_todo(
+                            todo_id=todo_id,
+                            title=new_title,
+                            start_date=new_start.isoformat(),
+                            due_date=new_due.isoformat(),
+                            priority=new_priority,
+                            roles=roles,
+                        )
+                        if ok:
+                            st.session_state.pop("editing_todo_id", None)
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.warning(msg)
 
             st.caption(f"총 {len(filtered_sorted)}개 항목")
 
