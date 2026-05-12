@@ -1,6 +1,7 @@
 # 로컬 데이터
 todos.json
 roles.json
+ignored_role_tags.json
 
 # Python 가상환경
 .venv/

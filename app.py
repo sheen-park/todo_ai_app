@@ -145,13 +145,21 @@ def update_role_name(tag: str, name: str) -> list[dict]:
     return roles
 
 
+def delete_role(tag: str) -> list[dict]:
+    """roles.json에서 역할을 삭제하고 저장합니다."""
+    tag = normalize_role_tag(tag)
+    roles = load_roles()
+    roles = [r for r in roles if r.get("tag") != tag]
+    save_roles(roles)
+    return roles
+
+
 def build_role_filter_options(roles: list[dict]) -> list[str]:
     """roles 목록에서 역할 필터 선택지를 동적으로 생성합니다."""
     options = ["전체", "미분류"]
     for role in roles:
         if role.get("active") and role.get("name"):
             options.append(role["name"])
-    options.append("미등록 역할")
     options.append("비활성 역할")
     return options
 
@@ -160,21 +168,33 @@ def build_role_filter_options(roles: list[dict]) -> list[str]:
 # 역할 태그 추출 함수
 # ---------------------------------------------------------------------------
 
+def get_unregistered_tags_in_title(title: str, roles: list[dict]) -> list[str]:
+    """제목의 @태그 중 roles에 등록되지 않은 태그만 반환합니다."""
+    registered = {r["tag"] for r in roles}
+    seen: list[str] = []
+    for raw in re.findall(r"@([A-Za-z0-9_-]+)", title):
+        tag = normalize_role_tag(raw)
+        if tag and tag not in registered and tag not in seen:
+            seen.append(tag)
+    return seen
+
+
 def extract_role_from_title(title: str, roles: list[dict]) -> tuple[str, str]:
-    """제목에서 첫 번째 @태그를 추출하여 (role_tag, role_name)을 반환합니다.
-    태그가 없으면 ("", "미분류")를 반환합니다.
-    roles에 없는 태그는 (tag, "미등록 역할")을 반환합니다.
+    """제목에서 @태그를 순서대로 찾아 (role_tag, role_name)을 반환합니다.
+    roles에 등록된 첫 번째 태그를 기준으로 판단합니다.
+    등록된 태그가 없으면 ("", "미분류")를 반환합니다.
+    미등록 @태그는 일반 문자로 취급합니다.
     """
     if not title:
         return "", "미분류"
-    match = re.search(r"@([A-Za-z0-9_-]+)", title)
-    if not match:
-        return "", "미분류"
-    tag = match.group(1).lower()
-    role = find_role_by_tag(roles, tag)
-    if role:
-        return tag, role["name"]
-    return tag, "미등록 역할"
+    for raw in re.findall(r"@([A-Za-z0-9_-]+)", title):
+        tag = normalize_role_tag(raw)
+        if not tag:
+            continue
+        role = find_role_by_tag(roles, tag)
+        if role:
+            return tag, role["name"]
+    return "", "미분류"
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +226,8 @@ def load_todos() -> list[dict]:
 
 
 def enrich_todos_with_roles(todos: list[dict], roles: list[dict]) -> list[dict]:
-    """할 일 목록에 role_tag/role_name을 roles.json 기준으로 정상화(보정)합니다.
+    """할 일 목록에 role_tag/role_name을 roles.json 기준으로 최신화합니다.
+    등록된 @태그만 역할로 인정하며, 미등록 @태그만 있는 todo는 "미분류"가 됩니다.
     메모리만 변경하므로 todos.json은 자동 덮어쓰지 않습니다.
     """
     for item in todos:
@@ -225,8 +246,13 @@ def save_todos(todos: list[dict]) -> None:
         st.error(f"저장 중 오류가 발생했습니다: {e}")
 
 
-def add_todo(title: str, start_date: str, due_date: str, priority: str,
-             roles: list[dict] | None = None) -> dict:
+def add_todo(
+    title: str,
+    start_date: str,
+    due_date: str,
+    priority: str,
+    roles: list[dict] | None = None,
+) -> dict:
     """새 할 일을 생성하고 저장합니다.
     # 향후 user_id 추가 가능
     """
@@ -369,12 +395,101 @@ def build_display_df(todos: list[dict], selected_date: date) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def render_input_form(roles: list[dict]) -> None:
-    """할 일 직접 입력 폼을 렌더링합니다."""
+    """할 일 직접 입력 폼을 렌더링합니다.
+
+    미등록 @태그 처리:
+    - 제목에 미등록 @태그가 발견되면 등록 여부를 묻는 phase 2로 전환합니다.
+    - 등록하지 않고 저장하면 해당 todo는 미분류로 저장됩니다.
+    """
     st.subheader("✏️ 할 일 추가")
     active_tags = ", ".join(
         f"@{r['tag']}" for r in roles if r.get("active")
     )
     st.caption(f"제목에 역할 태그를 붙이면 역할별로 분류됩니다. 예: {active_tags}")
+
+    pending = st.session_state.get("_pending_todo", None)
+
+    # ── Phase 2: 미등록 태그 발견 → 역할명 입력 및 active 설정 ──────────
+    if pending:
+        p_title = pending["title"]
+        p_start = pending["start_date"]
+        p_due = pending["due_date"]
+        p_priority = pending["priority"]
+        unreg_tags = pending["unregistered_tags"]  # list[str]
+        is_leading = pending.get("is_leading", False)
+
+        st.warning("미등록 @태그가 발견되었습니다. 역할명을 입력하면 등록됩니다.")
+        st.caption("같은 @태그가 기존 할 일 제목에 남아 있다면, 등록 후 자동으로 같은 분류로 인식됩니다.")
+        if is_leading:
+            st.caption("제목 앞의 @태그는 분류 의도가 강해 보입니다. 등록을 권장합니다.")
+        st.caption("'등록 후 사용함'을 끄고 등록하면 비활성 역할로 저장되며, 비활성 역할 필터에서 확인할 수 있습니다.")
+        st.markdown(f"할 일: **{p_title}**")
+
+        with st.form("pending_tag_form"):
+            tag_names: dict[str, str] = {}
+            tag_active: dict[str, bool] = {}
+            for utag in unreg_tags:
+                st.markdown(f"`@{utag}`")
+                c_name, c_chk = st.columns([0.65, 0.35])
+                tag_names[utag] = c_name.text_input(
+                    "역할명",
+                    placeholder=f"@{utag} 역할명",
+                    key=f"pending_name_{utag}",
+                    label_visibility="collapsed",
+                )
+                tag_active[utag] = c_chk.checkbox(
+                    "등록 후 사용함",
+                    value=True,
+                    key=f"pending_active_{utag}",
+                )
+
+            cb1, cb2, cb3 = st.columns([0.42, 0.35, 0.23])
+            with cb1:
+                do_register_save = st.form_submit_button("입력한 역할 등록 후 저장", type="primary")
+            with cb2:
+                do_save_only = st.form_submit_button("등록하지 않고 저장")
+            with cb3:
+                do_cancel = st.form_submit_button("취소")
+
+        if do_cancel:
+            st.session_state.pop("_pending_todo", None)
+            st.rerun()
+
+        if do_save_only:
+            add_todo(
+                title=p_title,
+                start_date=p_start,
+                due_date=p_due,
+                priority=p_priority,
+                roles=roles,
+            )
+            st.session_state.pop("_pending_todo", None)
+            st.success("저장되었습니다. 미등록 태그는 미분류로 처리됩니다.")
+            st.rerun()
+
+        if do_register_save:
+            # 역할명이 입력된 태그만 등록 대상
+            to_register = [t for t in unreg_tags if tag_names.get(t, "").strip()]
+            if not to_register:
+                st.warning("등록할 역할명을 하나 이상 입력해 주세요. 역할 등록 없이 저장하려면 [등록하지 않고 저장]을 눌러 주세요.")
+            else:
+                current_roles = roles
+                for t in to_register:
+                    current_roles = add_role(t, tag_names[t].strip(), active=tag_active[t])
+                add_todo(
+                    title=p_title,
+                    start_date=p_start,
+                    due_date=p_due,
+                    priority=p_priority,
+                    roles=current_roles,
+                )
+                st.session_state.pop("_pending_todo", None)
+                registered_str = ", ".join(f"@{t}" for t in to_register)
+                st.success(f"저장되었습니다. 등록된 태그: {registered_str}")
+                st.rerun()
+        return
+
+    # ── Phase 1: 일반 입력 form ───────────────────────────────────────────
     with st.form("add_todo_form", clear_on_submit=True):
         title = st.text_input("할 일 제목 *")
         col1, col2 = st.columns(2)
@@ -386,20 +501,34 @@ def render_input_form(roles: list[dict]) -> None:
         submitted = st.form_submit_button("저장")
 
     if submitted:
-        if not title.strip():
+        title_stripped = title.strip()
+        if not title_stripped:
             st.warning("할 일 제목을 입력해 주세요.")
         elif due_date < start_date:
             st.warning("마감일은 시작일보다 빠를 수 없습니다.")
         else:
-            add_todo(
-                title=title.strip(),
-                start_date=start_date.isoformat(),
-                due_date=due_date.isoformat(),
-                priority=priority,
-                roles=roles,
-            )
-            st.success("저장되었습니다!")
-            st.rerun()
+            unreg = get_unregistered_tags_in_title(title_stripped, roles)
+            if unreg:
+                is_leading = title_stripped.startswith("@")
+                st.session_state["_pending_todo"] = {
+                    "title": title_stripped,
+                    "start_date": start_date.isoformat(),
+                    "due_date": due_date.isoformat(),
+                    "priority": priority,
+                    "unregistered_tags": unreg,
+                    "is_leading": is_leading,
+                }
+                st.rerun()
+            else:
+                add_todo(
+                    title=title_stripped,
+                    start_date=start_date.isoformat(),
+                    due_date=due_date.isoformat(),
+                    priority=priority,
+                    roles=roles,
+                )
+                st.success("저장되었습니다!")
+                st.rerun()
 
 
 def render_today_view(todos: list[dict], selected_date: date, roles: list[dict]) -> None:
@@ -455,14 +584,11 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
             st.rerun()
 
 
-def render_all_view(selected_date: date, roles: list[dict]) -> None:
+def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -> None:
     """전체 보기 섹션을 렌더링합니다.
-    항상 최신 데이터를 직접 불러와 필터링에 반영합니다.
+    main()에서 enrich된 todos를 받아 필터링에 반영합니다.
     """
     st.subheader("📂 전체 보기")
-
-    todos = load_todos()
-    todos = enrich_todos_with_roles(todos, roles)
 
     role_filter_options = build_role_filter_options(roles)
 
@@ -507,9 +633,6 @@ def render_all_view(selected_date: date, roles: list[dict]) -> None:
         if role_filter != "전체":
             if role_filter == "미분류":
                 if todo_role_tag != "":
-                    continue
-            elif role_filter == "미등록 역할":
-                if todo_role_name != "미등록 역할":
                     continue
             elif role_filter == "비활성 역할":
                 if todo_role_name not in inactive_role_names:
@@ -562,35 +685,73 @@ def render_all_view(selected_date: date, roles: list[dict]) -> None:
     st.caption(f"총 {len(filtered_sorted)}개 항목")
 
 
-def render_role_manager(roles: list[dict], todos: list[dict]) -> None:
+def _render_role_rows(role_list: list[dict]) -> None:
+    """역할 목록 행들을 렌더링합니다 (헤더 + 역할명 편집 + 삭제 포함)."""
+    header_cols = st.columns([0.18, 0.22, 0.28, 0.13, 0.10, 0.09])
+    header_cols[0].markdown("**태그**")
+    header_cols[1].markdown("**현재 역할명**")
+    header_cols[2].markdown("**새 역할명**")
+    header_cols[3].markdown("**사용 여부**")
+    for role in role_list:
+        tag = role.get("tag", "")
+        name = role.get("name", "")
+        active = bool(role.get("active", True))
+        c_tag, c_name, c_rename, c_active, c_rename_btn, c_del = st.columns(
+            [0.18, 0.22, 0.28, 0.13, 0.10, 0.09]
+        )
+        c_tag.markdown(f"`@{tag}`")
+        c_name.markdown(name)
+        new_name_val = c_rename.text_input(
+            "새 역할명",
+            key=f"role_rename_{tag}",
+            label_visibility="collapsed",
+            placeholder="변경할 이름",
+        )
+        new_active = c_active.checkbox(
+            "활성",
+            value=active,
+            key=f"role_active_{tag}",
+            label_visibility="collapsed",
+        )
+        if c_rename_btn.button("변경", key=f"role_rename_btn_{tag}"):
+            if not new_name_val.strip():
+                st.warning(f"@{tag}의 새 역할명을 입력해 주세요.")
+            elif new_name_val.strip() == name:
+                st.info(f"@{tag}의 역할명이 이미 '{name}'입니다.")
+            else:
+                update_role_name(tag, new_name_val.strip())
+                st.rerun()
+        if c_del.button("삭제", key=f"role_del_{tag}"):
+            delete_role(tag)
+            st.rerun()
+        if new_active != active:
+            update_role_active(tag, new_active)
+            st.rerun()
+
+
+def render_role_manager(roles: list[dict]) -> None:
     """역할/분류 관리 expander를 렌더링합니다."""
     with st.expander("⚙️ 역할/분류 관리", expanded=False):
+        st.caption(
+            "분류는 제목에 남아 있는 @태그와 현재 roles.json을 기준으로 자동 계산됩니다. "
+            "분류를 삭제하면 해당 @태그는 일반 문자로 처리되고, "
+            "같은 태그를 다시 등록하면 기존 할 일도 자동으로 다시 분류됩니다."
+        )
 
-        # ── 현재 역할 목록 ──────────────────────────────────────────────
-        st.markdown("**현재 역할 목록**")
-        if roles:
-            header_cols = st.columns([0.2, 0.45, 0.2, 0.15])
-            header_cols[0].markdown("**태그**")
-            header_cols[1].markdown("**역할명**")
-            header_cols[2].markdown("**사용 여부**")
-            for role in roles:
-                tag = role.get("tag", "")
-                name = role.get("name", "")
-                active = bool(role.get("active", True))
-                c_tag, c_name, c_active, _ = st.columns([0.2, 0.45, 0.2, 0.15])
-                c_tag.markdown(f"`@{tag}`")
-                c_name.markdown(name)
-                new_active = c_active.checkbox(
-                    "활성",
-                    value=active,
-                    key=f"role_active_{tag}",
-                    label_visibility="collapsed",
-                )
-                if new_active != active:
-                    update_role_active(tag, new_active)
-                    st.rerun()
+        active_roles = [r for r in roles if r.get("active")]
+        inactive_roles = [r for r in roles if not r.get("active")]
+
+        # ── 활성 역할 목록 ─────────────────────────────────────────────
+        st.markdown("**활성 역할**")
+        if active_roles:
+            _render_role_rows(active_roles)
         else:
-            st.info("등록된 역할이 없습니다.")
+            st.info("활성 역할이 없습니다.")
+
+        # ── 비활성 역할 목록 ──────────────────────────────────────────
+        if inactive_roles:
+            with st.expander(f"비활성 역할 ({len(inactive_roles)}개)", expanded=False):
+                _render_role_rows(inactive_roles)
 
         st.divider()
 
@@ -616,33 +777,6 @@ def render_role_manager(roles: list[dict], todos: list[dict]) -> None:
                 add_role(norm_tag, new_name_input.strip())
                 st.success(f"@{norm_tag} ({new_name_input.strip()}) 등록 완료!")
                 st.rerun()
-
-        st.divider()
-
-        # ── 미등록 역할 후보 ────────────────────────────────────────────
-        unregistered_tags = sorted({
-            t.get("role_tag", "")
-            for t in todos
-            if t.get("role_name") == "미등록 역할" and t.get("role_tag", "")
-        })
-        if unregistered_tags:
-            st.markdown("**미등록 역할 후보**")
-            for u_tag in unregistered_tags:
-                uc1, uc2, uc3 = st.columns([0.25, 0.50, 0.25])
-                uc1.markdown(f"`@{u_tag}`")
-                u_name = uc2.text_input(
-                    "역할명",
-                    key=f"unreg_name_{u_tag}",
-                    label_visibility="collapsed",
-                    placeholder="역할명 입력",
-                )
-                if uc3.button("등록", key=f"unreg_btn_{u_tag}"):
-                    if not u_name.strip():
-                        st.warning(f"@{u_tag}의 역할명을 입력해 주세요.")
-                    else:
-                        add_role(u_tag, u_name.strip())
-                        st.success(f"@{u_tag} ({u_name.strip()}) 등록 완료!")
-                        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -676,12 +810,12 @@ def main() -> None:
     st.divider()
 
     # 하단: 전체 보기
-    render_all_view(selected_date, roles)
+    render_all_view(todos, selected_date, roles)
 
     st.divider()
 
     # 역할/분류 관리
-    render_role_manager(roles, todos)
+    render_role_manager(roles)
 
 
 if __name__ == "__main__":
