@@ -8,7 +8,9 @@
 # 4. Auth + user_id - multi-user data separation
 # =============================================================================
 
+import html as html_lib
 import json
+import os
 import re
 import uuid
 from datetime import date, datetime
@@ -16,6 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # 경로 설정
@@ -254,6 +257,7 @@ def add_todo(
     due_date: str,
     priority: str,
     roles: list[dict] | None = None,
+    memo: str = "",
 ) -> dict:
     """새 할 일을 생성하고 저장합니다.
     # 향후 user_id 추가 가능
@@ -272,7 +276,7 @@ def add_todo(
         "priority": priority,
         "role_tag": role_tag,
         "role_name": role_name,
-        "memo": "",
+        "memo": memo if memo is not None else "",
         "done": False,
         "created_at": now,
         "updated_at": now,
@@ -437,6 +441,526 @@ def summarize_memo(memo: str, max_len: int = 80) -> str:
     return text
 
 
+def escape_html(value: object) -> str:
+    """HTML 특수문자를 이스케이프합니다."""
+    return html_lib.escape(str(value or ""))
+
+
+_MEMO_BANNED_PHRASES = [
+    "기준일",
+    "파싱",
+    "단일 완성 단계",
+    "AI가",
+    "추정",
+    "배분함",
+    "전체 기간",
+    "출력",
+    "사용자 명시",
+    "초안 이후",
+    "단계로 배분",
+]
+
+
+def sanitize_ai_memo(memo: object) -> str:
+    """AI 생성 memo에서 시스템 설명 문장을 제거합니다."""
+    text = str(memo or "").strip()
+    if not text:
+        return ""
+    import re as _re
+    sentences = _re.split(r"(?<=[.!?。])\ *", text)
+    kept = [s for s in sentences if s.strip() and not any(p in s for p in _MEMO_BANNED_PHRASES)]
+    result = " ".join(kept).strip()
+    # 구두점 없이 단일 구 형태인 경우도 처리
+    if not kept:
+        if any(p in text for p in _MEMO_BANNED_PHRASES):
+            return ""
+        return text
+    return result
+
+
+def inject_compact_todo_css() -> None:
+    """todo 목록용 compact CSS를 페이지에 주입합니다."""
+    st.markdown(
+        """
+        <style>
+        .todo-title {
+            font-size: 0.97rem;
+            line-height: 1.35;
+            font-weight: 650;
+        }
+        .todo-meta {
+            font-size: 0.80rem;
+            line-height: 1.25;
+            color: #6b7280;
+            margin-top: 0.08rem;
+        }
+        .todo-memo {
+            font-size: 0.78rem;
+            line-height: 1.25;
+            color: #9ca3af;
+            margin-top: 0.1rem;
+        }
+        .todo-block {
+            margin-bottom: 0.35rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI 자연어 파싱 헬퍼
+# ---------------------------------------------------------------------------
+
+_MINDLOGIC_BASE_URL = "https://factchat-cloud.mindlogic.ai/v1/gateway"
+_MINDLOGIC_MODEL = "gpt-5.4-mini"
+
+
+def get_mindlogic_api_key() -> str:
+    """Mindlogic API 키를 반환합니다. secrets → 환경변수 순으로 탐색합니다."""
+    try:
+        key = st.secrets.get("SM_MINDLOGIC", "")
+        if key:
+            return str(key).strip()
+    except Exception:
+        pass
+    return os.environ.get("SM_MINDLOGIC", "").strip()
+
+
+def get_mindlogic_client() -> OpenAI | None:
+    """Mindlogic OpenAI 호환 클라이언트를 반환합니다. 키가 없으면 None을 반환합니다."""
+    key = get_mindlogic_api_key()
+    if not key:
+        return None
+    return OpenAI(api_key=key, base_url=_MINDLOGIC_BASE_URL)
+
+
+def build_ai_parse_prompt(
+    raw_text: str,
+    base_date: date,
+    roles: list[dict],
+    decompose: bool = True,
+) -> str:
+    """한국어 자연어 todo 파싱 전용 프롬프트를 생성합니다."""
+    role_info = ", ".join(
+        f"@{r['tag']}({r['name']})" for r in roles if r.get("tag")
+    ) or "없음"
+    decompose_instruction = (
+        "decompose=true: 산출물 단계가 명확하면 2~4개 후보로 분해합니다."
+        if decompose
+        else (
+            "decompose=false: 반드시 JSON array 안에 1개 객체만 반환합니다. "
+            "초안/검토/수정/최종안 같은 세부 단계는 title로 분해하지 않습니다. "
+            "title은 전체 업무명 하나로 만들고, 세부 단계는 memo에 요약합니다. "
+            "예: {{\"title\": \"[AAA보고서] 작성 @kca\", \"start_date\": \"...\", \"due_date\": \"...\", "
+            "\"priority\": \"상\", \"memo\": \"초안 작성, 검토 및 수정, 최종안 작성까지 포함한 통합 업무.\"}}"
+        )
+    )
+    return f"""당신은 한국어 자연어 문장에서 할 일 목록을 추출하는 전문가입니다.
+
+기준일: {base_date.isoformat()}
+등록된 역할 태그 목록 (참고용): {role_info}
+분해 모드: {decompose_instruction}
+
+[title 작성 규칙 - 반드시 준수]
+- 각 후보 title은 서로 구분되는 실행 단계명을 반드시 포함해야 합니다.
+- 같은 title을 여러 후보에 반복하지 않습니다.
+- 단계 차이를 memo에만 숨기지 말고 title에 드러냅니다.
+- memo는 추정 근거·주의사항 용도이며, 핵심 단계명은 title에 있어야 합니다.
+- 원문에 @태그가 명시되어 있으면, 등록 여부와 관계없이 모든 관련 후보 title 맨 마지막에 그대로 유지합니다.
+- @태그는 title의 맨 마지막에 배치합니다. 앞에 두지 않습니다.
+- 새 @태그를 임의로 만들지 않습니다. 원문에 없는 @태그는 추가하지 않습니다.
+- 원문에 [프로젝트명] 형태가 있으면 모든 후보 title에서 그대로 유지합니다.
+- 나쁜 title 예 (금지):
+  "@kca AAA 보고서 초안" (태그가 앞에 옴)
+  모든 후보 title이 동일한 형태
+  단계 차이는 memo에만 있고 title이 동일한 형태
+  "검토", "시작", "제출"처럼 단순 동작만 title이 되는 형태
+  여행/행사 주제에 "계획 초안", "계획 검토 및 수정", "계획 최종안" 붙이는 형태
+
+[업무 유형 판단 - 분해 전에 반드시 수행]
+입력 문장을 읽고 업무 유형을 먼저 판단합니다. 업무 유형에 따라 아래의 분해 전략을 선택합니다.
+
+A. 문서/보고서/발표자료/강의안/제안서형
+   - 해당 키워드: 보고서, 발표자료, 강의안, 제안서, 기획서, 문서, 논문, PPT
+   - 분해 가능한 단계: 자료 수집 → 목차 구성 → 초안 작성 → 검토 및 수정 → 최종본 완성 → 제출/발송
+   - "초안 / 검토 및 수정 / 최종안(최종본)" 구조는 이 유형에만 사용합니다.
+   - 제출/발송은 사용자가 명시했을 때만 별도 할 일로 만듭니다.
+
+B. 여행/가족여행/출장 계획형
+   - 해당 키워드: 여행, 가족여행, 출장, 여행계획, 여행 준비
+   - 초안/검토/최종안 구조를 절대 사용하지 않습니다.
+   - 분해 가능한 단계: 일정 후보 정리 → 항공/교통 확인 → 숙소 확인/예약 → 방문지·식당 리스트 정리 → 예산 확인 → 준비물 체크 → 예약 최종 확인
+   - 주제와 맥락에 맞는 단계만 선별합니다.
+
+C. 강의/교육 준비형
+   - 해당 키워드: 강의 준비, 교육 준비, 수업 준비
+   - 강의안이 문서형 산출물이면 A 유형 단계 일부 사용 가능합니다.
+   - 분해 가능한 단계: 강의 목표 정리 → 강의 목차 구성 → 강의자료 작성 → 실습/예제 준비 → 최종 점검
+
+D. 행사/모임 준비형
+   - 해당 키워드: 행사, 모임, 파티, 회식, 세미나, 발표회
+   - 초안/검토/최종안 구조를 사용하지 않습니다.
+   - 분해 가능한 단계: 일정/장소 확정 → 참석자 확인 → 준비물 정리 → 안내 메시지 발송 → 당일 체크
+
+E. 구매/예약/처리형
+   - 해당 키워드: 구매, 예약, 신청, 접수, 등록
+   - 단순 업무는 하나의 후보로 둡니다.
+   - 복잡한 경우에만: 후보 조사 → 비교 → 결정 → 구매/예약 → 확인
+
+F. 병원/행정/생활 업무형
+   - 해당 키워드: 병원, 검사, 행정, 서류, 민원, 생활
+   - 보통은 하나의 할 일로 둡니다.
+   - 명확한 사전 준비 + 후속 처리가 있을 때만 2~3개로 분해합니다.
+
+[기계적 분해 금지 규칙 - 반드시 준수]
+- 여행, 가족여행, 출장, 모임, 행사, 예약, 구매, 병원, 생활 업무에 "초안 / 검토 및 수정 / 최종안"을 적용하지 않습니다.
+- 사용자가 "보고서", "발표자료", "강의안", "문서", "제안서"처럼 문서형 산출물을 명시한 경우에만 초안/검토/최종안 구조를 고려합니다.
+- "계획 초안", "계획 검토 및 수정", "계획 최종안"처럼 계획을 문서로 취급하지 않습니다.
+- title만 다르고 실제 의미가 유사한 후보를 반복하지 않습니다.
+- 단순 업무를 억지로 3단계로 나누지 않습니다.
+
+[날짜 배분 규칙 - 반드시 준수]
+여러 단계로 분해할 때 각 후보의 날짜는 반드시 서로 다르게 순차 배분해야 합니다.
+모든 후보에 동일한 start_date/due_date를 넣는 것은 잘못된 출력입니다.
+
+우선순위 (높은 순으로 적용):
+1. 사용자가 특정 단계의 날짜를 명시한 경우 → 그 날짜를 그대로 사용합니다.
+2. 사용자가 특정 단계의 소요 기간을 명시한 경우 → 그 기간을 반영합니다.
+3. 사용자가 전체 시작일과 전체 마감일만 명시한 경우 → 전체 기간을 단계별로 비례 배분합니다.
+   - 문서형: 초안/작성 40~50%, 검토 20~30%, 최종 나머지
+   - 여행/행사/준비형: 초기 조사·후보 정리(앞 구간) → 예약·확정(중간 구간) → 준비물·최종 확인(마감 직전)
+   - 각 단계는 최소 1일 이상 확보합니다.
+   - 이전 단계 due_date 다음 날을 다음 단계 start_date로 사용합니다.
+4. 시작일이 없고 마감일만 있는 경우 → 기준일({base_date.isoformat()})을 전체 시작일로 사용합니다.
+5. 전체 기간이 매우 짧아 나누기 어려운 경우 → 후보 수를 1~2개로 줄입니다.
+
+날짜 배분 조건:
+- 각 후보: start_date <= due_date
+- 후보 간 날짜가 순차적으로 이어집니다 (겹치지 않음)
+- 마지막 후보의 due_date = 전체 최종 마감일
+- 모든 날짜는 YYYY-MM-DD 형식
+
+[파싱 규칙]
+1. 업무 유형을 판단한 뒤 해당 유형의 분해 전략을 사용합니다.
+2. "작성 시작", "작업 시작"만 있는 항목은 별도 할 일로 만들지 않습니다.
+3. 최종 제출일이 있고 최종본 완성 단계가 이미 있으면 별도 "제출" 항목을 만들지 않습니다.
+   단, "서류 업로드", "메일 발송"처럼 별도 실행 행위가 명확하면 별도 할 일로 만들 수 있습니다.
+4. 상대 날짜("다음주 월요일", "이달 말")는 기준일({base_date.isoformat()}) 기준으로 YYYY-MM-DD로 변환합니다.
+5. 날짜가 불명확하면 기준일을 사용합니다. 추정 근거·파싱 설명은 memo에 쓰지 않습니다.
+6. start_date가 due_date보다 늦으면 안 됩니다.
+7. 우선순위: "매우 중요"/"중요"/"급함" → "상", 단서 없으면 "중", 낮으면 "하".
+8. role_tag, role_name 필드는 만들지 않습니다.
+9. memo에는 사용자가 실제 업무 수행에 참고할 내용만 적습니다. 날짜 해석 근거, 기준일, 파싱 방식, AI 배분 설명, "추정" 같은 문구는 memo에 쓰지 않습니다. 별도 참고사항이 없으면 memo는 ""로 둡니다.
+
+[출력 예시 1 - 여행 계획형 (B유형) - 초안/검토/최종안 금지]
+입력: "이번달 말 제주도 가족여행 계획짜기 @family"
+기준일 2026-05-13, 이번달 말 = 2026-05-31 기준:
+올바른 출력:
+[
+  {{"title": "제주도 가족여행 일정 후보 정리 @family", "start_date": "2026-05-13", "due_date": "2026-05-17", "priority": "중", "memo": ""}},
+  {{"title": "제주도 가족여행 교통·숙소 확인 @family", "start_date": "2026-05-18", "due_date": "2026-05-22", "priority": "중", "memo": ""}},
+  {{"title": "제주도 가족여행 방문지·식당 리스트 정리 @family", "start_date": "2026-05-23", "due_date": "2026-05-27", "priority": "중", "memo": ""}},
+  {{"title": "제주도 가족여행 준비물 및 예약 최종 확인 @family", "start_date": "2026-05-28", "due_date": "2026-05-31", "priority": "중", "memo": ""}}
+]
+나쁜 출력 (절대 금지):
+[
+  {{"title": "제주도 가족여행 계획 초안 @family", ...}},
+  {{"title": "제주도 가족여행 계획 검토 및 수정 @family", ...}},
+  {{"title": "제주도 가족여행 계획 최종안 @family", ...}}
+]
+
+[출력 예시 2 - 보고서형 (A유형) - 초안/검토/최종안 허용]
+입력: "AAA 보고서를 5월 15일까지 작성해야 해. 초안 만들고 검토 후 최종본으로 만들 거야. @kca"
+올바른 출력 방향:
+[
+  {{"title": "AAA 보고서 초안 @kca", "start_date": "2026-05-01", "due_date": "2026-05-08", "priority": "중", "memo": ""}},
+  {{"title": "AAA 보고서 검토 및 수정 @kca", "start_date": "2026-05-09", "due_date": "2026-05-12", "priority": "중", "memo": ""}},
+  {{"title": "AAA 보고서 최종본 @kca", "start_date": "2026-05-13", "due_date": "2026-05-15", "priority": "중", "memo": ""}}
+]
+
+[출력 예시 3 - 강의 준비형 (C유형)]
+입력: "이번주까지 질문의기술 B2B과정 강의안 작성완료. 상. @how로 분류"
+decompose=true일 때 올바른 출력 방향:
+[
+  {{"title": "질문의기술 B2B과정 강의 목차 구성 @how", "start_date": "...", "due_date": "...", "priority": "상", "memo": ""}},
+  {{"title": "질문의기술 B2B과정 강의자료 작성 @how", "start_date": "...", "due_date": "...", "priority": "상", "memo": ""}},
+  {{"title": "질문의기술 B2B과정 최종 점검 @how", "start_date": "...", "due_date": "...", "priority": "상", "memo": ""}}
+]
+decompose=false일 때 올바른 출력 방향:
+[
+  {{"title": "질문의기술 B2B과정 강의안 작성 @how", "start_date": "...", "due_date": "...", "priority": "상", "memo": "강의 목차 구성, 강의자료 작성, 최종 점검 포함."}}
+]
+
+[출력 예시 4 - 사용자 명시 날짜 우선]
+입력: "[AAA보고서] 다음주 월요일 시작해서 다음주 토요일까지 초안을 만들고, 그다음주 토요일까지 최종안을 만들거야. @kca 관련이고 중요해"
+올바른 출력 방향:
+[
+  {{"title": "[AAA보고서] 초안 @kca", "start_date": "<다음주 월요일>", "due_date": "<다음주 토요일>", "priority": "상", "memo": ""}},
+  {{"title": "[AAA보고서] 최종안 @kca", "start_date": "<다음주 토요일 다음 날>", "due_date": "<그다음주 토요일>", "priority": "상", "memo": ""}}
+]
+(위 꺾쇠 안 날짜는 실제 기준일 기반으로 YYYY-MM-DD로 계산해서 넣으세요.)
+
+[출력 형식]
+반드시 JSON array만 출력합니다. 설명, markdown, code fence를 출력하지 않습니다.
+[
+  {{
+    "title": "string",
+    "start_date": "YYYY-MM-DD",
+    "due_date": "YYYY-MM-DD",
+    "priority": "상|중|하",
+    "memo": "string"
+  }}
+]
+
+[입력 문장]
+{raw_text}"""
+
+
+def extract_json_array_from_text(text: str) -> list[dict]:
+    """모델 응답 텍스트에서 JSON array를 안정적으로 파싱합니다."""
+    text = text.strip()
+    try:
+        result = json.loads(text)
+        if not isinstance(result, list):
+            raise ValueError("응답이 JSON array가 아닙니다.")
+        return result
+    except json.JSONDecodeError:
+        pass
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("응답에서 JSON array를 찾을 수 없습니다.")
+    try:
+        result = json.loads(text[start:end + 1])
+        if not isinstance(result, list):
+            raise ValueError("응답이 JSON array가 아닙니다.")
+        return result
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON 파싱 실패: {e}") from e
+
+
+def normalize_ai_todo_candidates(
+    items: list[dict], base_date: date, raw_text: str = ""
+) -> tuple[list[dict], list[str]]:
+    """AI 결과를 앱 내부 후보 형식으로 보정합니다.
+    반환: (유효한 candidates list, warnings list)
+    """
+    candidates: list[dict] = []
+    warnings: list[str] = []
+    valid_priorities = {"상", "중", "하"}
+
+    for i, item in enumerate(items):
+        label = f"후보 {i + 1}"
+        title = str(item.get("title", "")).strip()
+        if not title:
+            warnings.append(f"{label}: 제목이 비어 있어 제외됩니다.")
+            continue
+
+        priority = str(item.get("priority", "중")).strip()
+        if priority not in valid_priorities:
+            warnings.append(f"{label} '{title}': 우선순위 '{priority}'를 '중'으로 보정합니다.")
+            priority = "중"
+
+        start_str = str(item.get("start_date", "") or "")
+        due_str = str(item.get("due_date", "") or "")
+        start = _parse_date(start_str)
+        due = _parse_date(due_str)
+
+        if start is None:
+            warnings.append(f"{label} '{title}': 시작일 '{start_str}'이 올바르지 않아 기준일로 보정합니다.")
+            start = base_date
+            start_str = base_date.isoformat()
+        if due is None:
+            warnings.append(f"{label} '{title}': 마감일 '{due_str}'이 올바르지 않아 기준일로 보정합니다.")
+            due = base_date
+            due_str = base_date.isoformat()
+        if due < start:
+            warnings.append(f"{label} '{title}': 마감일이 시작일보다 이르므로 시작일로 맞춥니다.")
+            due = start
+            due_str = start_str
+
+        memo = sanitize_ai_memo(item.get("memo", ""))
+
+        candidates.append({
+            "title": title,
+            "start_date": start_str,
+            "due_date": due_str,
+            "priority": priority,
+            "memo": memo,
+        })
+
+    # 여러 후보가 모두 동일한 날짜이면 경고
+    if len(candidates) > 1:
+        dates_set = {(c["start_date"], c["due_date"]) for c in candidates}
+        if len(dates_set) == 1:
+            warnings.append(
+                "⚠️ 모든 후보의 시작일·마감일이 동일합니다. "
+                "단계별 날짜가 제대로 배분되지 않았을 수 있습니다. "
+                "후보를 직접 확인하고 필요하면 날짜를 수정해 주세요."
+            )
+
+    # 여행/행사형 업무가 문서형 패턴(초안/검토/최종안)으로 분해된 경우 경고
+    _TRAVEL_EVENT_KW = {"여행", "가족여행", "출장", "여행계획", "모임", "행사", "파티", "회식", "세미나", "발표회"}
+    _DOC_STAGE_KW = {"초안", "검토 및 수정", "최종안", "최종본"}
+    _raw_has_travel = any(kw in raw_text for kw in _TRAVEL_EVENT_KW)
+    _titles = [c.get("title", "") for c in candidates]
+    _doc_stage_count = sum(
+        1 for t in _titles if any(kw in t for kw in _DOC_STAGE_KW)
+    )
+    if _raw_has_travel and len(candidates) > 1 and _doc_stage_count >= 2:
+        warnings.append(
+            "⚠️ 여행/행사형 업무가 문서형 단계(초안/검토/최종안)로 분해된 것으로 보입니다. "
+            "후보 제목을 확인해 주세요."
+        )
+
+    return candidates, warnings
+
+
+def parse_todos_with_ai(
+    raw_text: str,
+    base_date: date,
+    roles: list[dict],
+    decompose: bool = True,
+) -> tuple[list[dict], list[str], str]:
+    """Mindlogic API를 호출해 자연어를 todo 후보로 파싱합니다.
+    반환: (candidates, warnings, raw_response_text)
+    """
+    client = get_mindlogic_client()
+    if client is None:
+        raise RuntimeError("API 키가 설정되어 있지 않습니다. SM_MINDLOGIC 키를 확인해 주세요.")
+
+    prompt = build_ai_parse_prompt(raw_text, base_date, roles, decompose=decompose)
+    response = client.chat.completions.create(
+        model=_MINDLOGIC_MODEL,
+        messages=[
+            {"role": "system", "content": "당신은 할 일 파싱 전문가입니다. JSON array만 출력합니다."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    raw_text_response = response.choices[0].message.content or ""
+    items = extract_json_array_from_text(raw_text_response)
+    candidates, warnings = normalize_ai_todo_candidates(items, base_date, raw_text=raw_text)
+    if not decompose and len(candidates) > 1:
+        single = collapse_candidates_to_single(raw_text, candidates, base_date)
+        candidates = [single]
+        warnings.append("분해 옵션이 꺼져 있어 여러 후보를 하나의 할 일로 합쳤습니다.")
+    return candidates, warnings, raw_text_response
+
+
+def format_date_kr_short(d) -> str:
+    """date 또는 YYYY-MM-DD 문자열을 'M/D(요일)' 형식으로 반환합니다.
+    변환 실패 시 원문 문자열을 반환합니다.
+    """
+    _KR_WEEKDAY = ["월", "화", "수", "목", "금", "토", "일"]
+    if isinstance(d, str):
+        original = d
+        d = _parse_date(d)
+        if d is None:
+            return original
+    try:
+        return f"{d.month}/{d.day}({_KR_WEEKDAY[d.weekday()]})"
+    except Exception:
+        return str(d)
+
+
+_STAGE_WORDS = re.compile(
+    r"(초안|검토\s*및\s*수정|검토|수정|최종안|최종본|수정본|완성본|완성|작성)\s*$",
+    re.UNICODE,
+)
+_AT_TAG_RE = re.compile(r"@\w+")
+_BRACKET_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def collapse_candidates_to_single(
+    raw_text: str,
+    candidates: list[dict],
+    base_date: date,
+) -> dict:
+    """여러 candidates를 하나의 단일 candidate로 합칩니다. decompose=False 시 사용합니다."""
+    priority_order = {"상": 0, "중": 1, "하": 2}
+
+    # start_date: 가장 이른 날짜
+    start_dates = [_parse_date(c["start_date"]) for c in candidates if _parse_date(c["start_date"])]
+    best_start = min(start_dates) if start_dates else base_date
+
+    # due_date: 가장 늦은 날짜
+    due_dates = [_parse_date(c["due_date"]) for c in candidates if _parse_date(c["due_date"])]
+    best_due = max(due_dates) if due_dates else best_start
+
+    # priority: 가장 높은 우선순위
+    priorities = [c.get("priority", "중") for c in candidates]
+    best_priority = min(priorities, key=lambda p: priority_order.get(p, 1))
+
+    # @태그: 후보 title들 또는 raw_text에서 추출 (중복 제거, 첫 번째 사용)
+    all_tags: list[str] = []
+    for c in candidates:
+        all_tags.extend(_AT_TAG_RE.findall(c.get("title", "")))
+    if not all_tags:
+        all_tags.extend(_AT_TAG_RE.findall(raw_text))
+    tag_suffix = f" {all_tags[0]}" if all_tags else ""
+
+    # [프로젝트명] 추출
+    bracket_match = _BRACKET_RE.match(raw_text.strip())
+    bracket_prefix = f"[{bracket_match.group(1)}] " if bracket_match else ""
+
+    # title 생성
+    if bracket_prefix:
+        base_title = f"{bracket_prefix}작성{tag_suffix}"
+    else:
+        # 후보 title에서 @태그와 단계어 제거 후 공통 prefix 추출
+        cleaned = []
+        for c in candidates:
+            t = c.get("title", "")
+            t = _AT_TAG_RE.sub("", t).strip()
+            t = _STAGE_WORDS.sub("", t).strip()
+            if t:
+                cleaned.append(t)
+        if cleaned:
+            # 공통 prefix: 첫 번째 cleaned를 기준으로 모든 것과 공통인 부분
+            common = cleaned[0]
+            for other in cleaned[1:]:
+                # 단어 단위로 공통 prefix 찾기
+                words_a = common.split()
+                words_b = other.split()
+                common_words = []
+                for wa, wb in zip(words_a, words_b):
+                    if wa == wb:
+                        common_words.append(wa)
+                    else:
+                        break
+                common = " ".join(common_words)
+            common = common.strip()
+            if common:
+                base_title = f"{common} 작성{tag_suffix}"
+            else:
+                # 첫 후보 기반
+                first_clean = cleaned[0] if cleaned else "할 일"
+                base_title = f"{first_clean} 작성{tag_suffix}" if first_clean else f"할 일 정리{tag_suffix}"
+        else:
+            base_title = f"할 일 정리{tag_suffix}"
+
+    # memo: 세부 단계 요약
+    stage_parts = []
+    for c in candidates:
+        t = c.get("title", "")
+        t_clean = _AT_TAG_RE.sub("", t).strip()
+        s = format_date_kr_short(c.get("start_date", ""))
+        d = format_date_kr_short(c.get("due_date", ""))
+        stage_parts.append(f"{t_clean}({s}~{d})")
+    memo_text = "세부 단계: " + ", ".join(stage_parts) if stage_parts else ""
+
+    return {
+        "title": base_title,
+        "start_date": best_start.isoformat(),
+        "due_date": best_due.isoformat(),
+        "priority": best_priority,
+        "memo": memo_text,
+    }
+
+
 def sort_todos_for_today(
     todos: list[dict], selected_date: date, sort_mode: str
 ) -> list[dict]:
@@ -480,14 +1004,263 @@ def build_display_df(todos: list[dict], selected_date: date) -> pd.DataFrame:
 # 섹션 렌더링 함수
 # ---------------------------------------------------------------------------
 
-def render_input_form(roles: list[dict]) -> None:
+@st.dialog("📋 할 일 상세")
+def _show_todo_detail_dialog(todo: dict, selected_date: date) -> None:
+    """할 일 상세 팝업 (조회 전용)."""
+    status = compute_status(todo, selected_date)
+    done_str = "✅ 완료" if todo.get("done") else "⬜ 미완료"
+    st.markdown(f"### {escape_html(todo.get('title', ''))}", unsafe_allow_html=False)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(f"**분류** {todo.get('role_name', '미분류')}")
+        st.markdown(f"**시작일** {todo.get('start_date', '-')}")
+        st.markdown(f"**마감일** {todo.get('due_date', '-')}")
+    with col_b:
+        st.markdown(f"**우선순위** {todo.get('priority', '-')}")
+        st.markdown(f"**상태** {status}")
+        st.markdown(f"**완료** {done_str}")
+    memo = str(todo.get("memo", "") or "")
+    if memo.strip():
+        st.divider()
+        st.markdown("**메모**")
+        st.markdown(memo)
+
+
+def _open_detail(todo: dict, selected_date: date, key: str) -> None:
+    """상세 팝업 열기 버튼 helper (st.dialog 트리거)."""
+    if st.button("🔍", key=key, help="상세 보기"):
+        _show_todo_detail_dialog(todo, selected_date)
+
+
+def _ai_save_payloads(
+    payloads: list[dict],
+    roles: list[dict],
+    selected_date: date,
+) -> None:
+    """AI 후보 payload 목록을 add_todo()로 저장하고 session_state를 정리합니다."""
+    import streamlit as _st
+    saved_count = 0
+    for p in payloads:
+        s = _parse_date(p["start_date"]) or selected_date
+        d = _parse_date(p["due_date"]) or selected_date
+        add_todo(
+            title=p["title"],
+            start_date=s.isoformat(),
+            due_date=d.isoformat(),
+            priority=p["priority"],
+            roles=roles,
+            memo=p.get("memo", ""),
+        )
+        saved_count += 1
+    _st.session_state.pop("_ai_pending_todos", None)
+    _st.session_state.pop("_ai_last_raw_response", None)
+    _st.session_state.pop("_ai_parse_warnings", None)
+    _st.session_state.pop("_ai_pending_apply_todos", None)
+    _st.session_state.pop("_ai_pending_unregistered_tags", None)
+    if saved_count:
+        _st.success(f"{saved_count}개 저장되었습니다.")
+    _st.rerun()
+
+
+def render_ai_parse_section(selected_date: date, roles: list[dict]) -> None:
+    """AI 자연어 입력 섹션을 렌더링합니다."""
+    with st.expander("🤖 AI 자연어 입력", expanded=True):
+        if not get_mindlogic_api_key():
+            st.warning("SM_MINDLOGIC API 키가 설정되지 않았습니다.")
+
+        raw_input = st.text_area(
+            "자연어로 할 일 입력",
+            key="ai_parse_input",
+            height=110,
+            placeholder="예: 이번주까지 질문의기술 B2B과정 강의안 작성 완료. 상. @how로 분류",
+            label_visibility="collapsed",
+        )
+
+        decompose = st.checkbox(
+            "여러 할 일로 분해",
+            value=True,
+            key="ai_decompose",
+            help="체크 시 산출물 단계별로 분해, 해제 시 하나의 할 일로 정리",
+        )
+
+        if st.button("AI로 정리", key="ai_parse_btn"):
+            if not raw_input.strip():
+                st.warning("입력 내용을 작성해 주세요.")
+            elif not get_mindlogic_api_key():
+                st.warning("API 키가 없어 AI 파싱을 실행할 수 없습니다.")
+            else:
+                with st.spinner("AI가 할 일 후보를 생성 중입니다..."):
+                    try:
+                        candidates, parse_warnings, raw_resp = parse_todos_with_ai(
+                            raw_input.strip(), selected_date, roles, decompose=decompose
+                        )
+                        st.session_state["_ai_pending_todos"] = candidates
+                        st.session_state["_ai_last_raw_response"] = raw_resp
+                        st.session_state["_ai_parse_warnings"] = parse_warnings
+                    except RuntimeError as e:
+                        st.warning(str(e))
+                    except ValueError as e:
+                        st.error(f"JSON 파싱 오류: {e}")
+                        raw_resp = st.session_state.get("_ai_last_raw_response", "")
+                        if raw_resp:
+                            with st.expander("AI 원본 응답 확인", expanded=False):
+                                st.text(raw_resp[:1000])
+                    except Exception as e:
+                        st.error(f"AI 호출 중 오류가 발생했습니다: {e}")
+
+        # ── 보정 경고 표시 ─────────────────────────────────────────────
+        parse_warnings = st.session_state.get("_ai_parse_warnings", [])
+        if parse_warnings:
+            for w in parse_warnings:
+                st.warning(w)
+
+        # ── 후보 미리보기: st.data_editor 표 ──────────────────────────
+        candidates = st.session_state.get("_ai_pending_todos")
+        if not candidates:
+            return
+
+        st.caption(f"{len(candidates)}개 후보 — 필요한 항목만 선택해 적용하세요.")
+
+        df_rows = []
+        for cand in candidates:
+            df_rows.append({
+                "선택": True,
+                "할 일": cand["title"],
+                "시작일": format_date_kr_short(cand["start_date"]),
+                "마감일": format_date_kr_short(cand["due_date"]),
+                "우선순위": cand["priority"],
+                "메모": cand.get("memo", ""),
+            })
+
+        display_df = pd.DataFrame(df_rows)
+        editor_height = min(220, 80 + len(display_df) * 36)
+        edited_df = st.data_editor(
+            display_df,
+            column_config={
+                "선택": st.column_config.CheckboxColumn("선택", default=True),
+                "할 일": st.column_config.TextColumn("할 일", width="large"),
+                "시작일": st.column_config.TextColumn("시작일", disabled=True),
+                "마감일": st.column_config.TextColumn("마감일", disabled=True),
+                "우선순위": st.column_config.SelectboxColumn(
+                    "우선순위", options=["상", "중", "하"]
+                ),
+                "메모": st.column_config.TextColumn("메모", width="medium"),
+            },
+            hide_index=True,
+            height=editor_height,
+            width="stretch",
+            key="ai_candidate_editor",
+        )
+
+        # ── 미등록 @태그 등록 UI (pending 상태일 때) ──────────────────
+        ai_pending_payloads = st.session_state.get("_ai_pending_apply_todos")
+        ai_pending_unreg = st.session_state.get("_ai_pending_unregistered_tags")
+
+        if ai_pending_payloads is not None and ai_pending_unreg is not None:
+            st.warning("미등록 @태그가 있습니다. 역할명을 입력하면 등록 후 적용됩니다.")
+            ai_tag_names: dict[str, str] = {}
+            ai_tag_active: dict[str, bool] = {}
+            with st.form("ai_pending_tag_form"):
+                for utag in ai_pending_unreg:
+                    st.markdown(f"`@{utag}`")
+                    _nc, _ac = st.columns([0.65, 0.35])
+                    ai_tag_names[utag] = _nc.text_input(
+                        "역할명",
+                        placeholder=f"@{utag} 역할명",
+                        key=f"ai_pending_name_{utag}",
+                    )
+                    ai_tag_active[utag] = _ac.checkbox(
+                        "사용함",
+                        value=True,
+                        key=f"ai_pending_active_{utag}",
+                    )
+                _b1, _b2, _b3 = st.columns(3)
+                do_register_apply = _b1.form_submit_button("등록 후 적용")
+                do_skip_apply = _b2.form_submit_button("등록하지 않고 적용")
+                do_ai_tag_cancel = _b3.form_submit_button("취소")
+
+            if do_ai_tag_cancel:
+                st.session_state.pop("_ai_pending_apply_todos", None)
+                st.session_state.pop("_ai_pending_unregistered_tags", None)
+                st.rerun()
+
+            if do_register_apply:
+                missing = [u for u in ai_pending_unreg if not ai_tag_names.get(u, "").strip()]
+                if missing:
+                    st.warning(f"역할명을 입력해 주세요: {', '.join(f'@{u}' for u in missing)}")
+                else:
+                    current_roles = roles
+                    for utag in ai_pending_unreg:
+                        current_roles = add_role(utag, ai_tag_names[utag].strip(), active=ai_tag_active[utag])
+                    _ai_save_payloads(ai_pending_payloads, current_roles, selected_date)
+
+            if do_skip_apply:
+                _ai_save_payloads(ai_pending_payloads, roles, selected_date)
+
+            return
+
+        # ── 적용 / 취소 버튼 ──────────────────────────────────────────
+        btn_apply, btn_cancel = st.columns([1, 1])
+
+        with btn_apply:
+            if st.button("적용", key="ai_save_btn"):
+                # 선택된 후보 payload 수집
+                apply_payloads = []
+                skipped = []
+                for idx, row in edited_df.iterrows():
+                    if not row["선택"]:
+                        continue
+                    t = str(row["할 일"]).strip()
+                    if not t:
+                        skipped.append(f"후보 {idx + 1}: 제목이 비어 있어 건너뜁니다.")
+                        continue
+                    orig = candidates[idx]
+                    s = _parse_date(orig["start_date"]) or selected_date
+                    d = _parse_date(orig["due_date"]) or selected_date
+                    if d < s:
+                        skipped.append(f"'{t}': 마감일이 시작일보다 이릅니다. 건너뜁니다.")
+                        continue
+                    apply_payloads.append({
+                        "title": t,
+                        "start_date": s.isoformat(),
+                        "due_date": d.isoformat(),
+                        "priority": str(row["우선순위"]),
+                        "memo": str(row["메모"]),
+                    })
+                for msg in skipped:
+                    st.warning(msg)
+                if not apply_payloads:
+                    if not skipped:
+                        st.warning("선택된 후보가 없습니다.")
+                else:
+                    # 미등록 @태그 수집
+                    unreg_set: set[str] = set()
+                    for p in apply_payloads:
+                        unreg_set.update(get_unregistered_tags_in_title(p["title"], roles))
+                    if unreg_set:
+                        st.session_state["_ai_pending_apply_todos"] = apply_payloads
+                        st.session_state["_ai_pending_unregistered_tags"] = sorted(unreg_set)
+                        st.rerun()
+                    else:
+                        _ai_save_payloads(apply_payloads, roles, selected_date)
+
+        with btn_cancel:
+            if st.button("취소", key="ai_clear_btn"):
+                st.session_state.pop("_ai_pending_todos", None)
+                st.session_state.pop("_ai_last_raw_response", None)
+                st.session_state.pop("_ai_parse_warnings", None)
+                st.rerun()
+
+
+def render_input_form(roles: list[dict], show_header: bool = True) -> None:
     """할 일 직접 입력 폼을 렌더링합니다.
 
     미등록 @태그 처리:
     - 제목에 미등록 @태그가 발견되면 등록 여부를 묻는 phase 2로 전환합니다.
     - 등록하지 않고 저장하면 해당 todo는 미분류로 저장됩니다.
     """
-    st.subheader("✏️ 할 일 추가")
+    if show_header:
+        st.subheader("✏️ 할 일 추가")
     active_tags = ", ".join(
         f"@{r['tag']}" for r in roles if r.get("active")
     )
@@ -661,7 +1434,7 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
         todo_id = todo["id"]
         current_done = bool(todo.get("done", False))
         checkbox_key = get_done_checkbox_key("today", todo)
-        col1, col2 = st.columns([0.06, 0.94])
+        col1, col2, col3 = st.columns([0.05, 0.88, 0.07])
         with col1:
             new_done = st.checkbox(
                 label="완료",
@@ -673,12 +1446,21 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
             role_label = todo.get("role_name", "미분류")
             _today_memo = str(todo.get("memo", "") or "")
             memo_flag = " 📝" if _today_memo.strip() and not show_today_memo else ""
-            memo_line = f"  \n📝 {summarize_memo(_today_memo)}" if show_today_memo and _today_memo.strip() else ""
-            st.markdown(
-                f"{icon}{memo_flag} **{todo['title']}**  \n"
-                f"[{role_label}] 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')}"
-                f"{memo_line}"
+            memo_html = (
+                f'<div class="todo-memo">📝 {escape_html(summarize_memo(_today_memo, max_len=40))}</div>'
+                if show_today_memo and _today_memo.strip()
+                else ""
             )
+            st.markdown(
+                f'<div class="todo-block">'
+                f'<div class="todo-title">{escape_html(icon)}{escape_html(memo_flag)} {escape_html(todo["title"])}</div>'
+                f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(todo.get("due_date",""))} | 우선순위: {escape_html(todo.get("priority",""))}</div>'
+                f'{memo_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with col3:
+            _open_detail(todo, selected_date, key=f"detail_today_{todo_id}")
         if new_done != current_done:
             update_todo_done(todo_id, new_done)
             st.rerun()
@@ -700,84 +1482,138 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
 
     # ── 우측 패널: 보기 설정 ───────────────────────────────────────────
     with right_col:
-        st.markdown("**보기 설정**")
+        show_done = st.checkbox("완료 포함", value=True, key="all_show_done")
 
-        show_done = st.checkbox("완료 항목 포함", value=True, key="all_show_done")
-        priority_filter = st.selectbox(
-            "우선순위",
-            ["전체", "상", "중", "하"],
-            key="priority_filter",
-        )
-        status_filter = st.selectbox(
-            "상태",
-            ["전체", "예정", "진행 중", "오늘 마감", "지연", "완료"],
-            key="status_filter",
+        sort_mode = st.radio(
+            "정렬",
+            ["마감일", "주제"],
+            horizontal=True,
+            key="all_sort_mode",
+            label_visibility="collapsed",
         )
 
-        st.markdown("**분류 표시**")
+        _PRI_OPTS = [("전체", "전", "전체"), ("상", "상", "우선순위 상"), ("중", "중", "우선순위 중"), ("하", "하", "우선순위 하")]
+        if "priority_filter" not in st.session_state:
+            st.session_state["priority_filter"] = "전체"
+        _pcols = st.columns(4)
+        for _pc, (_pval, _plbl, _phelp) in zip(_pcols, _PRI_OPTS):
+            _psel = st.session_state["priority_filter"] == _pval
+            if _pc.button(
+                _plbl,
+                key=f"pf_btn_{_pval}",
+                help=_phelp,
+                type="primary" if _psel else "secondary",
+                width="stretch",
+            ):
+                st.session_state["priority_filter"] = _pval
+                st.rerun()
+        priority_filter = st.session_state["priority_filter"]
 
-        # 전체 체크 / 전체 해제 버튼 (checkbox 렌더링 전에 배치)
+        _STATUS_ROWS = [
+            [("전체", "📋"), ("진행 중", "🟢"), ("오늘 마감", "🟠")],
+            [("지연", "🔴"), ("예정", "🔵"), ("완료", "✅")],
+        ]
+        if "status_filter" not in st.session_state:
+            st.session_state["status_filter"] = "전체"
+        for _row_idx, _row in enumerate(_STATUS_ROWS):
+            _scols = st.columns(3)
+            for _sc, (_val, _icon) in zip(_scols, _row):
+                _selected = st.session_state["status_filter"] == _val
+                if _sc.button(
+                    _icon,
+                    key=f"sf_btn_{_row_idx}_{_val}",
+                    help=_val,
+                    type="primary" if _selected else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state["status_filter"] = _val
+                    st.rerun()
+        status_filter = st.session_state["status_filter"]
+
+        st.divider()
+        st.caption("분류")
+
+        # 전체 체크 / 전체 해제 버튼
         _vis_keys = (
             [f"vis_role_{r['tag']}" for r in active_roles]
             + (["vis_inactive"] if inactive_role_names else [])
             + ["vis_unclassified"]
         )
         _sel_col, _clr_col = st.columns(2)
-        if _sel_col.button("전체 체크", key="role_vis_select_all"):
+        if _sel_col.button("전체", key="role_vis_select_all"):
             for _k in _vis_keys:
                 st.session_state[_k] = True
             st.rerun()
-        if _clr_col.button("전체 해제", key="role_vis_clear_all"):
+        if _clr_col.button("해제", key="role_vis_clear_all"):
             for _k in _vis_keys:
                 st.session_state[_k] = False
             st.rerun()
 
-        # 분류별 체크박스: active 역할 → 비활성 역할 → 미분류 순
-        # (view filter — roles.json active 변경 없음)
+        # 분류별 체크박스: 1열 배치, help 제거, session_state 선설정
         role_vis: dict[str, bool] = {}
-        for role in active_roles:
-            rname = role["name"]
-            safe_key = f"vis_role_{role['tag']}"
-            role_vis[rname] = st.checkbox(rname, value=True, key=safe_key)
+        _role_opts: list[dict] = []
+        for _r in active_roles:
+            _role_opts.append({
+                "key": f"vis_role_{_r['tag']}",
+                "label": f"@{_r['tag']}",
+                "vis_key": _r["name"],
+            })
         if inactive_role_names:
-            role_vis["__inactive__"] = st.checkbox(
-                "비활성 역할", value=True, key="vis_inactive"
+            _role_opts.append({
+                "key": "vis_inactive",
+                "label": "비활성",
+                "vis_key": "__inactive__",
+            })
+        _role_opts.append({
+            "key": "vis_unclassified",
+            "label": "미분류",
+            "vis_key": "미분류",
+        })
+
+        for _opt in _role_opts:
+            if _opt["key"] not in st.session_state:
+                st.session_state[_opt["key"]] = True
+            _checked = st.checkbox(
+                _opt["label"],
+                key=_opt["key"],
             )
-        role_vis["미분류"] = st.checkbox("미분류", value=True, key="vis_unclassified")
+            role_vis[_opt["vis_key"]] = _checked
 
         st.divider()
 
         # ── 완료 항목 일괄 삭제 ────────────────────────────────────────
-        st.markdown("**완료 항목 정리**")
         completed_count = count_completed_todos(todos)
         if completed_count == 0:
-            st.caption("완료 항목이 없습니다.")
+            st.caption("완료 항목 없음")
         else:
-            st.caption(f"완료 항목: {completed_count}개")
+            st.caption(f"완료 {completed_count}개")
             confirm_delete = st.checkbox(
-                f"완료 항목 {completed_count}개 삭제를 확인합니다.",
+                f"{completed_count}개 삭제 확인",
                 value=False,
                 key="confirm_bulk_delete",
             )
-            if st.button("완료 항목 일괄 삭제", key="bulk_delete_btn"):
+            if st.button("완료 일괄 삭제", key="bulk_delete_btn"):
                 if not confirm_delete:
-                    st.warning("삭제를 확인하려면 위 체크박스를 선택해 주세요.")
+                    st.warning("위 체크박스를 선택해 주세요.")
                 else:
                     deleted = delete_completed_todos()
-                    st.success(f"완료 항목 {deleted}개를 삭제했습니다.")
+                    st.success(f"{deleted}개 삭제했습니다.")
                     st.rerun()
 
     # ── 좌측 패널: todo 목록 ──────────────────────────────────────────
     with left_col:
-        # 1) 완료 포함 여부
-        filtered = [t for t in todos if show_done or not t.get("done")]
+        # 1) 완료 포함 여부 — status_filter가 "완료"이면 완료 항목만 강제 표시
+        if status_filter == "완료":
+            filtered = [t for t in todos if t.get("done")]
+        else:
+            filtered = [t for t in todos if show_done or not t.get("done")]
 
         # 2) 우선순위 필터
         if priority_filter != "전체":
             filtered = [t for t in filtered if t.get("priority") == priority_filter]
 
-        # 3) 상태 필터
-        if status_filter != "전체":
+        # 3) 상태 필터 (완료는 위에서 처리)
+        if status_filter not in ("전체", "완료"):
             filtered = [
                 t for t in filtered
                 if compute_status(t, selected_date) == status_filter
@@ -795,16 +1631,31 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
 
         filtered = [t for t in filtered if _role_visible(t)]
 
+        def _clean_title_for_sort(title: str) -> str:
+            import re as _re
+            return _re.sub(r"@\w+", "", title).strip().lower()
+
         if not filtered:
             st.info("표시할 항목이 없습니다.")
         else:
-            filtered_sorted = sorted(
-                filtered,
-                key=lambda t: (
-                    PRIORITY_ORDER.get(t.get("priority", "하"), 2),
-                    t.get("due_date", ""),
-                ),
-            )
+            if sort_mode == "주제":
+                filtered_sorted = sorted(
+                    filtered,
+                    key=lambda t: (
+                        _clean_title_for_sort(t.get("title", "")),
+                        t.get("due_date", ""),
+                        PRIORITY_ORDER.get(t.get("priority", "하"), 2),
+                    ),
+                )
+            else:  # 마감일
+                filtered_sorted = sorted(
+                    filtered,
+                    key=lambda t: (
+                        t.get("due_date", ""),
+                        PRIORITY_ORDER.get(t.get("priority", "하"), 2),
+                        _clean_title_for_sort(t.get("title", "")),
+                    ),
+                )
 
             for todo in filtered_sorted:
                 status = compute_status(todo, selected_date)
@@ -814,7 +1665,7 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                 checkbox_key = get_done_checkbox_key("all", todo)
                 is_editing = st.session_state.get("editing_todo_id") == todo_id
 
-                c1, c2, action_col = st.columns([0.05, 0.84, 0.11])
+                c1, c2, action_col = st.columns([0.04, 0.82, 0.14])
                 with c1:
                     new_done = st.checkbox(
                         label="완료",
@@ -825,19 +1676,27 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                 with c2:
                     role_label = todo.get("role_name", "미분류")
                     _memo = str(todo.get("memo", "") or "")
-                    _memo_line = f"  \n📝 {summarize_memo(_memo)}" if _memo.strip() else ""
+                    _memo_html = (
+                        f'<div class="todo-memo">📝 {escape_html(summarize_memo(_memo, max_len=40))}</div>'
+                        if _memo.strip() else ""
+                    )
                     st.markdown(
-                        f"{icon} **{todo['title']}**  \n"
-                        f"[{role_label}] 시작: {todo.get('start_date','')} | 마감: {todo.get('due_date','')} | 우선순위: {todo.get('priority','')} | 상태: {status}"
-                        f"{_memo_line}"
+                        f'<div class="todo-block">'
+                        f'<div class="todo-title">{escape_html(icon)} {escape_html(todo["title"])}</div>'
+                        f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(todo.get("due_date",""))} | {escape_html(todo.get("priority",""))} | {escape_html(status)}</div>'
+                        f'{_memo_html}'
+                        f'</div>',
+                        unsafe_allow_html=True,
                     )
                 with action_col:
-                    edit_col, del_col = st.columns(2)
-                    with edit_col:
+                    a1, a2, a3 = st.columns(3)
+                    with a1:
+                        _open_detail(todo, selected_date, key=f"detail_all_{todo_id}")
+                    with a2:
                         if st.button("✏️", key=f"edit_btn_{todo_id}", help="수정"):
                             st.session_state["editing_todo_id"] = todo_id
                             st.rerun()
-                    with del_col:
+                    with a3:
                         if st.button("🗑", key=f"del_{todo_id}", help="삭제"):
                             if st.session_state.get("editing_todo_id") == todo_id:
                                 st.session_state.pop("editing_todo_id", None)
@@ -1014,6 +1873,7 @@ def render_role_manager(roles: list[dict]) -> None:
 def main() -> None:
     st.set_page_config(page_title="개인용 AI 할 일 관리 앱", layout="wide")
     st.title("🧠 개인용 AI 할 일 관리 앱")
+    inject_compact_todo_css()
 
     # 기준일 선택
     selected_date: date = st.date_input(
@@ -1033,7 +1893,9 @@ def main() -> None:
     with left_col:
         render_today_view(todos, selected_date, roles)
     with right_col:
-        render_input_form(roles)
+        render_ai_parse_section(selected_date, roles)
+        with st.expander("✏️ 직접 입력", expanded=False):
+            render_input_form(roles, show_header=False)
 
     st.divider()
 
