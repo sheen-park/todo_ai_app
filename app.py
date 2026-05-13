@@ -13,7 +13,7 @@ import json
 import os
 import re
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -399,6 +399,94 @@ def compute_status(todo: dict, selected_date: date) -> str:
         return "진행 중"
     else:
         return "지연"
+
+
+# ---------------------------------------------------------------------------
+# 주간 계획 helper 함수
+# ---------------------------------------------------------------------------
+
+def get_week_range(base_date: date) -> tuple[date, date]:
+    """base_date가 속한 주의 월요일~일요일을 반환합니다."""
+    week_start = base_date - timedelta(days=base_date.weekday())
+    week_end = week_start + timedelta(days=6)
+    return week_start, week_end
+
+
+def get_next_week_range(base_date: date) -> tuple[date, date]:
+    """base_date가 속한 다음 주의 월요일~일요일을 반환합니다."""
+    week_start, week_end = get_week_range(base_date)
+    return week_start + timedelta(days=7), week_end + timedelta(days=7)
+
+
+def date_ranges_overlap(start1: date, end1: date, start2: date, end2: date) -> bool:
+    """두 날짜 구간이 하루라도 겹치면 True를 반환합니다."""
+    if start1 > end1 or start2 > end2:
+        return False
+    return start1 <= end2 and start2 <= end1
+
+
+def classify_todo_for_week(todo: dict, week_start: date, week_end: date) -> str:
+    """todo 하나를 주간 기준으로 분류합니다.
+
+    반환값: '완료' | '날짜 오류' | '지연' | '이번 주 마감' | '이번 주 진행' | '해당 없음'
+    '이번 주 마감'은 '이번 주 진행'보다 우선합니다.
+    """
+    if todo.get("done"):
+        return "완료"
+
+    start = _parse_date(todo.get("start_date", ""))
+    due = _parse_date(todo.get("due_date", ""))
+
+    if start is None or due is None:
+        return "날짜 오류"
+
+    if due < week_start:
+        return "지연"
+    if week_start <= due <= week_end:
+        return "이번 주 마감"
+    if start <= week_end and due >= week_start:
+        return "이번 주 진행"
+    return "해당 없음"
+
+
+def filter_todos_for_week(
+    todos: list[dict],
+    week_start: date,
+    week_end: date,
+    include_done: bool = False,
+) -> dict[str, list[dict]]:
+    """todo 목록을 주간 그룹별로 분류해서 반환합니다.
+
+    반환 키: '지연', '이번 주 마감', '이번 주 진행', '완료', '날짜 오류'
+    '해당 없음' 항목은 포함하지 않습니다.
+    include_done=False이면 완료 항목을 제외합니다.
+    각 그룹은 due_date → priority(상/중/하) → title 순으로 정렬됩니다.
+    """
+    groups: dict[str, list[dict]] = {
+        "지연": [],
+        "이번 주 마감": [],
+        "이번 주 진행": [],
+        "완료": [],
+        "날짜 오류": [],
+    }
+
+    for todo in todos:
+        label = classify_todo_for_week(todo, week_start, week_end)
+        if label == "해당 없음":
+            continue
+        if label == "완료" and not include_done:
+            continue
+        groups[label].append(todo)
+
+    def _sort_key(t: dict):
+        due = t.get("due_date", "9999-12-31")
+        pri = PRIORITY_ORDER.get(t.get("priority", "하"), 2)
+        return (due, pri, t.get("title", ""))
+
+    for label in groups:
+        groups[label].sort(key=_sort_key)
+
+    return groups
 
 
 # ---------------------------------------------------------------------------
