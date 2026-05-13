@@ -489,6 +489,77 @@ def filter_todos_for_week(
     return groups
 
 
+def get_priority_icon(priority: str) -> str:
+    """주간 보기 전용 우선순위 아이콘을 반환합니다."""
+    return {"상": "\u203c\ufe0f", "중": "\u2757"}.get(priority, "")
+
+
+def get_current_week_items(
+    todos: list[dict],
+    week_start: date,
+    week_end: date,
+) -> tuple[list[dict], list[dict]]:
+    """이번 주 진행률 계산 대상(weekly_total)과 미완료 실행 리스트(weekly_active)를 반환합니다.
+
+    weekly_total: 완료 여부와 관계없이 이번 주 실행 대상
+      - 완료 todo 중 날짜 범위가 이번 주와 겹치는 것
+      - 미완료 todo 중 due_date < week_start (지난 주까지 마감이었지만 미완료)
+      - 미완료 todo 중 이번 주 기간과 날짜가 겹치는 것
+    weekly_active: weekly_total 중 done == False
+    """
+
+    def _sort_key(t: dict):
+        pri = PRIORITY_ORDER.get(t.get("priority", "하"), 2)
+        due = t.get("due_date", "9999-12-31")
+        return (pri, due, t.get("title", ""))
+
+    weekly_total: list[dict] = []
+    for todo in todos:
+        start = _parse_date(todo.get("start_date", ""))
+        due = _parse_date(todo.get("due_date", ""))
+        if start is None or due is None:
+            continue
+        done = bool(todo.get("done"))
+        if done:
+            if date_ranges_overlap(start, due, week_start, week_end):
+                weekly_total.append(todo)
+        else:
+            if due < week_start or date_ranges_overlap(start, due, week_start, week_end):
+                weekly_total.append(todo)
+
+    weekly_active = [t for t in weekly_total if not t.get("done")]
+    weekly_active.sort(key=_sort_key)
+    return weekly_total, weekly_active
+
+
+def get_next_week_items(
+    todos: list[dict],
+    next_start: date,
+    next_end: date,
+) -> list[dict]:
+    """다음 주 기간과 겹치는 미완료 todo만 반환합니다. 지연 항목은 포함하지 않습니다."""
+
+    def _sort_key(t: dict):
+        pri = PRIORITY_ORDER.get(t.get("priority", "하"), 2)
+        due = t.get("due_date", "9999-12-31")
+        return (pri, due, t.get("title", ""))
+
+    result: list[dict] = []
+    for todo in todos:
+        if todo.get("done"):
+            continue
+        start = _parse_date(todo.get("start_date", ""))
+        due = _parse_date(todo.get("due_date", ""))
+        if start is None or due is None:
+            continue
+        if due < next_start:
+            continue
+        if date_ranges_overlap(start, due, next_start, next_end):
+            result.append(todo)
+    result.sort(key=_sort_key)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # UI 헬퍼 함수
 # ---------------------------------------------------------------------------
@@ -1164,8 +1235,8 @@ def _show_todo_detail_dialog(todo: dict, selected_date: date) -> None:
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown(f"**분류** {todo.get('role_name', '미분류')}")
-        st.markdown(f"**시작일** {todo.get('start_date', '-')}")
-        st.markdown(f"**마감일** {todo.get('due_date', '-')}")
+        st.markdown(f"**시작일** {format_date_kr_short(todo.get('start_date', '-'))}")
+        st.markdown(f"**마감일** {format_date_kr_short(todo.get('due_date', '-'))}")
     with col_b:
         st.markdown(f"**우선순위** {todo.get('priority', '-')}")
         st.markdown(f"**상태** {status}")
@@ -1541,6 +1612,59 @@ def render_input_form(roles: list[dict], show_header: bool = True) -> None:
                 st.rerun()
 
 
+def render_weekly_plan_view(todos: list[dict], selected_date: date, roles: list[dict]) -> None:
+    """주간 보기 섹션을 렌더링합니다. 실행 목록 + 진행률 요약."""
+    with st.expander("🗓 주간 보기", expanded=False):
+        range_mode = st.radio(
+            "주간 보기 범위",
+            ["이번 주", "다음 주"],
+            horizontal=True,
+            key="weekly_view_range_mode",
+            label_visibility="collapsed",
+        )
+
+        if range_mode == "이번 주":
+            week_start, week_end = get_week_range(selected_date)
+            st.caption(
+                f"이번 주: {format_date_kr_short(week_start)} ~ {format_date_kr_short(week_end)}"
+            )
+            weekly_total, weekly_active = get_current_week_items(todos, week_start, week_end)
+            total_count = len(weekly_total)
+            done_count = total_count - len(weekly_active)
+
+            if total_count == 0:
+                st.info("이번 주 할 일이 없습니다.")
+                return
+            if len(weekly_active) == 0:
+                st.success("이번 주 할 일을 모두 완료했습니다. 🎉")
+                return
+
+            st.markdown(f"**진행률 {done_count}/{total_count}**")
+            display_items = weekly_active
+
+        else:
+            next_start, next_end = get_next_week_range(selected_date)
+            st.caption(
+                f"다음 주: {format_date_kr_short(next_start)} ~ {format_date_kr_short(next_end)}"
+            )
+            display_items = get_next_week_items(todos, next_start, next_end)
+
+            if not display_items:
+                st.info("다음 주에 진행 예정인 할 일이 없습니다.")
+                return
+
+            st.markdown(f"**다음 주 진행 예정 {len(display_items)}개**")
+
+        for todo in display_items:
+            safe_title = escape_html(todo.get("title", ""))
+            icon = get_priority_icon(todo.get("priority", ""))
+            memo_icon = " 📝" if str(todo.get("memo") or "").strip() else ""
+            suffix = f" {icon}" if icon else ""
+            due_display = format_date_kr_short(todo.get("due_date", ""))
+            due_part = f" · {escape_html(due_display)}" if due_display else ""
+            st.markdown(f"- {safe_title}{due_part}{suffix}{memo_icon}", unsafe_allow_html=True)
+
+
 def render_today_view(todos: list[dict], selected_date: date, roles: list[dict]) -> None:
     """오늘 할 일 보기 섹션을 렌더링합니다."""
     st.subheader("📋 오늘 할 일")
@@ -1605,7 +1729,7 @@ def render_today_view(todos: list[dict], selected_date: date, roles: list[dict])
             st.markdown(
                 f'<div class="todo-block">'
                 f'<div class="todo-title">{escape_html(icon)}{escape_html(memo_flag)} {escape_html(todo["title"])}</div>'
-                f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(todo.get("due_date",""))} | 우선순위: {escape_html(todo.get("priority",""))}</div>'
+                f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(format_date_kr_short(todo.get("due_date","")))} | 우선순위: {escape_html(todo.get("priority",""))}</div>'
                 f'{memo_html}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -1834,7 +1958,7 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                     st.markdown(
                         f'<div class="todo-block">'
                         f'<div class="todo-title">{escape_html(icon)} {escape_html(todo["title"])}</div>'
-                        f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(todo.get("due_date",""))} | {escape_html(todo.get("priority",""))} | {escape_html(status)}</div>'
+                        f'<div class="todo-meta">[{escape_html(role_label)}] 마감: {escape_html(format_date_kr_short(todo.get("due_date","")))} | {escape_html(todo.get("priority",""))} | {escape_html(status)}</div>'
                         f'{_memo_html}'
                         f'</div>',
                         unsafe_allow_html=True,
@@ -2047,6 +2171,11 @@ def main() -> None:
         render_ai_parse_section(selected_date, roles)
         with st.expander("✏️ 직접 입력", expanded=False):
             render_input_form(roles, show_header=False)
+
+    st.divider()
+
+    # 주간 보기
+    render_weekly_plan_view(todos, selected_date, roles)
 
     st.divider()
 
