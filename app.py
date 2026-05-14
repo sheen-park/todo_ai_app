@@ -681,6 +681,60 @@ def build_combined_backup_json_bytes(todos: list[dict], roles: list[dict]) -> by
 
 
 # ---------------------------------------------------------------------------
+# 검색 helper 함수
+# ---------------------------------------------------------------------------
+
+def normalize_search_text(value: object) -> str:
+    """검색 비교용 문자열로 정규화합니다."""
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def get_todo_search_text(todo: dict) -> str:
+    """todo의 검색 대상 필드를 하나의 문자열로 결합합니다."""
+    role_tag_raw = str(todo.get("role_tag") or "").strip()
+    role_tag_plain = role_tag_raw.lstrip("@")
+    role_tag_at = f"@{role_tag_plain}" if role_tag_plain else ""
+
+    parts = [
+        todo.get("title"),
+        todo.get("memo"),
+        role_tag_plain,
+        role_tag_at,
+        todo.get("role_name"),
+        todo.get("priority"),
+    ]
+    joined = " ".join(str(p) if p is not None else "" for p in parts)
+    return normalize_search_text(joined)
+
+
+def todo_matches_search(todo: dict, query: str) -> bool:
+    """단일 todo가 검색어와 매칭되는지 반환합니다."""
+    normalized_query = normalize_search_text(query)
+    if not normalized_query:
+        return True
+
+    haystack = get_todo_search_text(todo)
+    # 고급 문법(OR/정규식 등)은 1차에서 의도적으로 지원하지 않습니다.
+    terms = [term for term in normalized_query.split(" ") if term]
+    return all(term in haystack for term in terms)
+
+
+def filter_todos_by_search(todos: list[dict], query: str) -> list[dict]:
+    """검색어로 todo 리스트를 필터링해 새 리스트로 반환합니다."""
+    if not normalize_search_text(query):
+        return list(todos)
+    return [todo for todo in todos if todo_matches_search(todo, query)]
+
+
+def count_search_results(todos: list[dict], query: str) -> int:
+    """검색 결과 개수를 반환합니다."""
+    return len(filter_todos_by_search(todos, query))
+
+
+# ---------------------------------------------------------------------------
 # UI 헬퍼 함수
 # ---------------------------------------------------------------------------
 
