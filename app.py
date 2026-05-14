@@ -2262,6 +2262,79 @@ def render_role_manager(roles: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 백업/내보내기 UI
+# ---------------------------------------------------------------------------
+
+def render_backup_export_section(todos: list[dict], roles: list[dict]) -> None:
+    """백업/내보내기 expander를 렌더링합니다. 읽기 전용 다운로드만 제공합니다."""
+    with st.expander("💾 백업/내보내기", expanded=False):
+        st.caption("⚠️ 이 기능은 다운로드 전용입니다. 복원 기능은 지원하지 않습니다.")
+
+        ts = get_timestamp_for_filename()
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**JSON 백업**")
+
+            # todos.json 다운로드
+            todos_bytes = read_file_bytes_if_exists(TODOS_FILE)
+            if todos_bytes is not None:
+                st.download_button(
+                    label="📥 todos.json 다운로드",
+                    data=todos_bytes,
+                    file_name=build_backup_filename("todos_backup", "json", ts),
+                    mime="application/json",
+                    key="dl_todos_json",
+                )
+            else:
+                st.info("todos.json 파일이 없습니다.")
+
+            # roles.json 다운로드
+            roles_bytes = read_file_bytes_if_exists(ROLES_FILE)
+            if roles_bytes is not None:
+                st.download_button(
+                    label="📥 roles.json 다운로드",
+                    data=roles_bytes,
+                    file_name=build_backup_filename("roles_backup", "json", ts),
+                    mime="application/json",
+                    key="dl_roles_json",
+                )
+            else:
+                st.info("roles.json 파일이 없습니다.")
+
+            # 통합 JSON 백업
+            st.download_button(
+                label="📥 통합 백업 (bundle.json) 다운로드",
+                data=build_combined_backup_json_bytes(todos, roles),
+                file_name=build_backup_filename("todo_app_backup", "json", ts),
+                mime="application/json",
+                key="dl_combined_json",
+            )
+
+        with col2:
+            st.markdown("**데이터 내보내기**")
+
+            # CSV 내보내기
+            st.download_button(
+                label="📥 CSV 내보내기",
+                data=todos_to_csv_bytes(todos),
+                file_name=build_backup_filename("todo_export", "csv", ts),
+                mime="text/csv",
+                key="dl_csv",
+            )
+
+            # Markdown 내보내기
+            st.download_button(
+                label="📥 Markdown 내보내기",
+                data=todos_to_markdown_bytes(todos),
+                file_name=build_backup_filename("todo_export", "md", ts),
+                mime="text/markdown",
+                key="dl_md",
+            )
+
+
+# ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 
@@ -2306,6 +2379,9 @@ def main() -> None:
 
     # 역할/분류 관리
     render_role_manager(roles)
+
+    # 백업/내보내기
+    render_backup_export_section(todos, roles)
 
 
 if __name__ == "__main__":
