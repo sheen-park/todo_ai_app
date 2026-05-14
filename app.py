@@ -52,33 +52,28 @@ def get_default_roles() -> list[dict]:
 
 def load_roles() -> list[dict]:
     """roles.json에서 역할 목록을 불러옵니다.
-    파일이 없으면 기본 역할 목록을 생성해 저장하고 반환합니다.
+    파일이 없으면 빈 리스트를 반환합니다.
+    읽기 실패 시 원본 파일을 변경하지 않고 경고를 표시한 뒤 빈 리스트를 반환합니다.
     """
-    if not ROLES_FILE.exists():
-        defaults = get_default_roles()
-        save_roles(defaults)
-        return defaults
-    try:
-        with open(ROLES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            st.warning("roles.json 형식이 올바르지 않아 기본 역할을 사용합니다.")
-            return get_default_roles()
-        now = datetime.now().isoformat()
-        for item in data:
-            item.setdefault("tag", "")
-            item["tag"] = normalize_role_tag(item["tag"])
-            item.setdefault("name", item["tag"])
-            item.setdefault("active", True)
-            item.setdefault("created_at", now)
-            item.setdefault("updated_at", now)
-        return data
-    except json.JSONDecodeError:
-        st.warning("roles.json 파일이 손상되었습니다. 기본 역할을 사용합니다.")
-        return get_default_roles()
-    except Exception as e:
-        st.warning(f"roles.json을 읽는 중 오류가 발생했습니다: {e}")
-        return get_default_roles()
+    data, error = read_json_file_safely(ROLES_FILE, list)
+
+    if error is not None:
+        if "파일이 없습니다" not in error:
+            st.warning(
+                format_json_load_error("roles.json", ROLES_FILE, error)
+                + " 앱은 임시로 빈 목록을 사용합니다."
+            )
+        return []
+
+    now = datetime.now().isoformat()
+    for item in data:
+        item.setdefault("tag", "")
+        item["tag"] = normalize_role_tag(item["tag"])
+        item.setdefault("name", item["tag"])
+        item.setdefault("active", True)
+        item.setdefault("created_at", now)
+        item.setdefault("updated_at", now)
+    return data
 
 
 def save_roles(roles: list[dict]) -> None:
@@ -260,23 +255,19 @@ def format_json_load_error(label: str, path: "Path", error_message: str) -> str:
 def load_todos() -> list[dict]:
     """todos.json에서 할 일 목록을 불러옵니다.
     파일이 없으면 빈 리스트를 반환합니다.
-    JSON 파싱 오류 시 빈 리스트를 반환하고 경고를 표시합니다.
+    읽기 실패 시 원본 파일을 변경하지 않고 경고를 표시한 뒤 빈 리스트를 반환합니다.
     """
-    if not TODOS_FILE.exists():
+    data, error = read_json_file_safely(TODOS_FILE, list)
+
+    if error is not None:
+        if "파일이 없습니다" not in error:
+            st.warning(
+                format_json_load_error("todos.json", TODOS_FILE, error)
+                + " 앱은 임시로 빈 목록을 사용합니다."
+            )
         return []
-    try:
-        with open(TODOS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            st.warning("todos.json 형식이 올바르지 않아 초기화합니다.")
-            return []
-        return data
-    except json.JSONDecodeError:
-        st.warning("todos.json 파일이 손상되었습니다. 빈 목록으로 시작합니다.")
-        return []
-    except Exception as e:
-        st.warning(f"todos.json을 읽는 중 오류가 발생했습니다: {e}")
-        return []
+
+    return data
 
 
 def enrich_todos_with_roles(todos: list[dict], roles: list[dict]) -> list[dict]:
