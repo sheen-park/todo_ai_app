@@ -202,6 +202,56 @@ def extract_role_from_title(title: str, roles: list[dict]) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# 데이터 안전 helper 함수
+# 원본 파일을 절대 수정하지 않는 순수 읽기 전용 유틸리티입니다.
+# st.warning() 등 UI 호출은 하지 않습니다. 호출 측에서 오류 메시지를 처리합니다.
+# ---------------------------------------------------------------------------
+
+def read_json_file_safely(
+    path: "Path", expected_type: type
+) -> "tuple[object | None, str | None]":
+    """JSON 파일을 안전하게 읽어 (data, error_message) 튜플로 반환합니다.
+
+    성공하면 (data, None), 실패하면 (None, 사용자_안내_메시지)를 반환합니다.
+    원본 파일은 어떤 경우에도 수정하지 않습니다.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, f"{path.name} 파일이 없습니다."
+    except json.JSONDecodeError:
+        return None, f"{path.name}의 JSON 형식이 올바르지 않습니다. 파일이 손상되었을 수 있습니다."
+    except PermissionError:
+        return None, f"{path.name} 파일 접근 권한이 없습니다."
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{path.name}을 읽는 중 오류가 발생했습니다. ({type(exc).__name__})"
+
+    if not isinstance(data, expected_type):
+        type_name = expected_type.__name__
+        return None, f"{path.name}의 구조가 올바르지 않습니다. {type_name} 형식이어야 합니다."
+
+    return data, None
+
+
+def safe_empty_for_type(expected_type: type) -> object:
+    """expected_type에 맞는 빈 기본값을 반환합니다."""
+    if expected_type is list:
+        return []
+    if expected_type is dict:
+        return {}
+    return None
+
+
+def format_json_load_error(label: str, path: "Path", error_message: str) -> str:
+    """사용자 안내용 JSON 읽기 오류 메시지를 반환합니다."""
+    return (
+        f"{label}을 읽을 수 없습니다. {error_message} "
+        f"원본 파일은 변경하지 않았습니다."
+    )
+
+
+# ---------------------------------------------------------------------------
 # 저장 계층 함수
 # 이 함수들만 todos.json 파일을 직접 읽거나 씁니다.
 # 향후 SQLite로 전환할 때는 이 함수들의 내부 구현만 교체합니다.
