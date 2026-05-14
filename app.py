@@ -8,6 +8,7 @@
 # 4. Auth + user_id - multi-user data separation
 # =============================================================================
 
+import fnmatch
 import html as html_lib
 import json
 import os
@@ -693,33 +694,96 @@ def normalize_search_text(value: object) -> str:
 
 
 def get_todo_search_text(todo: dict) -> str:
-    """todo의 검색 대상 필드를 하나의 문자열로 결합합니다."""
-    role_tag_raw = str(todo.get("role_tag") or "").strip()
-    role_tag_plain = role_tag_raw.lstrip("@")
-    role_tag_at = f"@{role_tag_plain}" if role_tag_plain else ""
+    """todo의 일반 검색 대상(title/memo/priority)을 하나의 문자열로 결합합니다.
 
+    role_name / role_tag는 의도적으로 제외합니다.
+    분류 태그 검색은 @-prefix 검색어로만 가능합니다.
+    """
     parts = [
         todo.get("title"),
         todo.get("memo"),
-        role_tag_plain,
-        role_tag_at,
-        todo.get("role_name"),
         todo.get("priority"),
     ]
     joined = " ".join(str(p) if p is not None else "" for p in parts)
     return normalize_search_text(joined)
 
 
+def get_todo_classification_search_values(todo: dict) -> list[str]:
+    """@검색어가 비교할 분류 관련 정규화 값 목록을 반환합니다.
+
+    포함 값: role_tag, @role_tag, role_name, 공백 제거 role_name.
+    role_name은 일반 검색어(@ 없음)로는 검색되지 않습니다.
+    """
+    values: list[str] = []
+    role_tag = str(todo.get("role_tag") or "").strip()
+    role_name = str(todo.get("role_name") or "").strip()
+
+    if role_tag:
+        plain_tag = role_tag.lstrip("@")
+        values.append(plain_tag)
+        values.append(f"@{plain_tag}")
+
+    if role_name:
+        values.append(role_name)
+        no_space = role_name.replace(" ", "")
+        if no_space != role_name:
+            values.append(no_space)
+
+    return [v for v in (normalize_search_text(v) for v in values) if v]
+
+
+def classification_term_matches(todo: dict, term: str) -> bool:
+    """@로 시작하는 단일 term이 todo의 분류 값과 매칭되는지 반환합니다.
+
+    - */?가 포함되면 fnmatch wildcard 매칭을 사용합니다.
+    - wildcard가 없으면 부분 포함 검색을 사용합니다.
+    - 고급 정규식은 지원하지 않습니다.
+    """
+    term = normalize_search_text(term)
+    if not term.startswith("@"):
+        return False
+
+    term_body = term[1:].strip()
+    if not term_body:
+        return False
+
+    values = get_todo_classification_search_values(todo)
+    has_wildcard = "*" in term_body or "?" in term_body
+
+    if has_wildcard:
+        patterns = [term_body, f"@{term_body}"]
+        return any(
+            fnmatch.fnmatchcase(value, pattern)
+            for value in values
+            for pattern in patterns
+        )
+
+    return any(term_body in value or term in value for value in values)
+
+
 def todo_matches_search(todo: dict, query: str) -> bool:
-    """단일 todo가 검색어와 매칭되는지 반환합니다."""
-    normalized_query = normalize_search_text(query)
-    if not normalized_query:
+    """단일 todo가 검색어와 매칭되는지 반환합니다.
+
+    - '@...'로 시작하는 term은 분류 검색(role_tag/role_name)으로 처리합니다.
+    - 그 외 term은 title/memo/priority 내 부분 포함 여부로 처리합니다.
+    - 고급 문법(OR/정규식 등)은 1차에서 의도적으로 지원하지 않습니다.
+    """
+    query_text = normalize_search_text(query)
+    if not query_text:
         return True
 
-    haystack = get_todo_search_text(todo)
-    # 고급 문법(OR/정규식 등)은 1차에서 의도적으로 지원하지 않습니다.
-    terms = [term for term in normalized_query.split(" ") if term]
-    return all(term in haystack for term in terms)
+    content_text = get_todo_search_text(todo)
+    terms = query_text.split()
+
+    for term in terms:
+        if term.startswith("@"):
+            if not classification_term_matches(todo, term):
+                return False
+        else:
+            if term not in content_text:
+                return False
+
+    return True
 
 
 def filter_todos_by_search(todos: list[dict], query: str) -> list[dict]:
@@ -1931,6 +1995,13 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
 
     # ── 우측 패널: 보기 설정 ───────────────────────────────────────────
     with right_col:
+        search_query = st.text_input(
+            "검색",
+            key="all_view_search_query",
+            placeholder="검색",
+            label_visibility="collapsed",
+        )
+
         show_done = st.checkbox("완료 포함", value=True, key="all_show_done")
 
         sort_mode = st.radio(
@@ -2080,12 +2151,19 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
 
         filtered = [t for t in filtered if _role_visible(t)]
 
+        # 5) 검색어 필터 (기존 필터와 AND 결합)
+        filtered = filter_todos_by_search(filtered, search_query)
+        normalized_search_query = normalize_search_text(search_query)
+
         def _clean_title_for_sort(title: str) -> str:
             import re as _re
             return _re.sub(r"@\w+", "", title).strip().lower()
 
         if not filtered:
-            st.info("표시할 항목이 없습니다.")
+            if normalized_search_query:
+                st.info("검색 결과가 없습니다.")
+            else:
+                st.info("표시할 항목이 없습니다.")
         else:
             if sort_mode == "주제":
                 filtered_sorted = sorted(
@@ -2105,6 +2183,9 @@ def render_all_view(todos: list[dict], selected_date: date, roles: list[dict]) -
                         _clean_title_for_sort(t.get("title", "")),
                     ),
                 )
+
+            if normalized_search_query:
+                st.caption(f"검색 결과 {len(filtered_sorted)}개")
 
             for todo in filtered_sorted:
                 status = compute_status(todo, selected_date)
