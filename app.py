@@ -561,6 +561,126 @@ def get_next_week_items(
 
 
 # ---------------------------------------------------------------------------
+# 백업/내보내기 helper 함수
+# ---------------------------------------------------------------------------
+
+def get_timestamp_for_filename() -> str:
+    """현재 시각을 파일명에 안전한 YYYYMMDD_HHMMSS 문자열로 반환합니다."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def read_file_bytes_if_exists(path: Path) -> bytes | None:
+    """파일이 있으면 bytes로 읽어 반환합니다. 없거나 오류 시 None을 반환합니다."""
+    try:
+        if path.exists():
+            return path.read_bytes()
+    except Exception:
+        pass
+    return None
+
+
+def build_backup_filename(prefix: str, extension: str, timestamp: str | None = None) -> str:
+    """백업/내보내기용 파일명을 생성합니다.
+
+    예: build_backup_filename("todos_backup", "json") → todos_backup_20260514_153000.json
+    extension에 점이 있어도 없어도 처리합니다.
+    """
+    ts = timestamp or get_timestamp_for_filename()
+    ext = extension.lstrip(".")
+    return f"{prefix}_{ts}.{ext}"
+
+
+def todos_to_csv_bytes(todos: list[dict]) -> bytes:
+    """todo 목록을 CSV bytes(UTF-8 with BOM)로 변환합니다."""
+    fields = [
+        "id", "title", "role_tag", "role_name",
+        "created_date", "start_date", "due_date",
+        "priority", "done", "memo", "created_at", "updated_at",
+    ]
+    rows = []
+    for todo in todos:
+        rows.append({f: todo.get(f, "") for f in fields})
+    df = pd.DataFrame(rows, columns=fields)
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+def todos_to_markdown(todos: list[dict]) -> str:
+    """todo 목록을 Markdown 문자열로 변환합니다.
+
+    미완료 항목 먼저, 완료 항목 나중에 표시합니다.
+    """
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    undone = [t for t in todos if not t.get("done")]
+    done = [t for t in todos if t.get("done")]
+
+    def _item_md(todo: dict) -> str:
+        priority = todo.get("priority", "")
+        title = todo.get("title", "")
+        role_name = todo.get("role_name") or "미분류"
+        start_str = format_date_kr_short(todo.get("start_date", ""))
+        due_str = format_date_kr_short(todo.get("due_date", ""))
+        memo = str(todo.get("memo", "") or "").strip()
+        lines = [
+            f"- [{priority}] {title}",
+            f"  - 분류: {role_name}",
+            f"  - 기간: {start_str} ~ {due_str}",
+        ]
+        if memo:
+            lines.append(f"  - 메모: {memo}")
+        return "\n".join(lines)
+
+    parts = [
+        "# Todo Export",
+        f"generated_at: {generated_at}",
+        "",
+        f"## 미완료 항목 ({len(undone)}개)",
+        "",
+    ]
+    if undone:
+        parts.extend(_item_md(t) for t in undone)
+    else:
+        parts.append("(없음)")
+
+    parts += [
+        "",
+        f"## 완료 항목 ({len(done)}개)",
+        "",
+    ]
+    if done:
+        parts.extend(_item_md(t) for t in done)
+    else:
+        parts.append("(없음)")
+
+    return "\n".join(parts)
+
+
+def todos_to_markdown_bytes(todos: list[dict]) -> bytes:
+    """todos_to_markdown()을 UTF-8 bytes로 인코딩해서 반환합니다."""
+    return todos_to_markdown(todos).encode("utf-8")
+
+
+def build_combined_backup_json_bytes(todos: list[dict], roles: list[dict]) -> bytes:
+    """todos와 roles를 하나의 JSON bundle로 묶어 UTF-8 bytes로 반환합니다.
+
+    구조:
+    {
+      "schema": "todo_ai_app_backup_v1",
+      "generated_at": "...",
+      "todos": [...],
+      "roles": [...]
+    }
+    secrets.toml, API key, ignored_role_tags.json은 포함하지 않습니다.
+    """
+    payload = {
+        "schema": "todo_ai_app_backup_v1",
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "todos": todos,
+        "roles": roles,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # UI 헬퍼 함수
 # ---------------------------------------------------------------------------
 
